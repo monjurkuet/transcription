@@ -7,7 +7,7 @@ Transcribe audio files using Groq Whisper API with automatic chunking for large 
 - **Round-Robin API Keys**: Automatically rotates through multiple API keys for higher throughput
 - **Automatic Chunking**: Splits large audio files into 10-minute chunks with 5-second overlap
 - **Quota Monitoring**: CLI tool to check remaining API quota
-- **Timestamp Support**: Outputs both `.txt` (plain text) and `.json` (with segment timestamps)
+- **Timestamp Support**: Outputs `.json` with segment timestamps and file metadata
 - **Progress Tracking**: Visual progress bar with file-level and chunk-level tracking
 - **Resume Support**: Skips already-transcribed files (checks for existing `.json`)
 - **Rate Limiting**: Automatic retry with exponential backoff for API rate limits
@@ -175,7 +175,7 @@ The script automatically chunks files exceeding 25MB (configurable via `MAX_FILE
 
 ### Single File
 ```
-/root/test.mp3 → /root/test_Transcript/test.txt, test.json
+/root/test.mp3 → /root/test_Transcript/test.json
 ```
 
 ### Directory
@@ -189,32 +189,37 @@ The script automatically chunks files exceeding 25MB (configurable via `MAX_FILE
 
 Output (/path/to/Audio_Transcriptions_Transcripts/):
 ├── 01 Beginners/
-│   ├── 01 Introduction.txt
 │   └── 01 Introduction.json
 ├── 06 Fibonacci/
-│   ├── 01 Fibonacci Retracements.txt
 │   └── 01 Fibonacci Retracements.json
 └── ...
 ```
 
 ### Output Files
 
-- **`.txt`**: Plain text transcription
-- **`.json`**: Full metadata with segment timestamps
+- **`.json`**: Full metadata with segment timestamps and file metadata
 
 ### JSON Output Format
 
 ```json
 {
-  "text": "Transcribed text content...",
+  "file_metadata": {
+    "filename": "audio.mp3",
+    "path": "/path/to/audio.mp3",
+    "size_bytes": 1048576,
+    "duration": 120.5,
+    "format": "mp3",
+    "bit_rate": 128000,
+    "codec": "mp3",
+    "sample_rate": 44100,
+    "channels": 2
+  },
   "segments": [
     {
       "id": 0,
-      "seek": 0,
       "start": 0.0,
       "end": 5.0,
-      "text": " Hello everybody, hope that you're doing very well",
-      "tokens": [50364, 479, 1277, ...],
+      "text": "Hello everybody, hope that you're doing very well",
       "temperature": 0.0,
       "avg_logprob": -0.15,
       "compression_ratio": 1.5,
@@ -275,7 +280,7 @@ ffprobe -v error -show_entries format=duration input.wav
 
 ### Resume Interrupted Transcription
 
-The script automatically skips files that already have `.json` output. To re-transcribe specific files, delete their `.txt` and `.json` outputs first.
+The script automatically skips files that already have `.json` output. To re-transcribe specific files, delete their `.json` outputs first.
 
 ## Logging
 

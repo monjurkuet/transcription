@@ -90,6 +90,38 @@ def get_audio_duration(audio_path: Path) -> float:
     return float(result.stdout.strip())
 
 
+def get_file_metadata(file_path: Path) -> Dict[str, Any]:
+    """Get comprehensive file metadata using ffprobe."""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        str(file_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    raw_metadata = json.loads(result.stdout)
+
+    # Extract relevant information
+    format_info = raw_metadata.get("format", {})
+    stream_info = raw_metadata.get("streams", [{}])[0] if raw_metadata.get("streams") else {}
+
+    return {
+        "filename": format_info.get("filename", ""),
+        "path": str(file_path),
+        "size_bytes": int(format_info.get("size", 0)),
+        "duration": float(format_info.get("duration", 0)),
+        "format": format_info.get("format_name", ""),
+        "bit_rate": int(format_info.get("bit_rate", 0)),
+        "codec": stream_info.get("codec_name", ""),
+        "sample_rate": int(stream_info.get("sample_rate", 0)),
+        "channels": stream_info.get("channels", 0),
+    }
+
+
 def chunk_audio(
     audio_path: Path,
     chunk_dir: Path,
@@ -276,6 +308,20 @@ def merge_transcriptions(
     return {"text": merged_text.strip(), "segments": merged_segments}
 
 
+def strip_metadata_fields(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove tokens and text field from transcription result."""
+    cleaned = result.copy()
+    # Remove tokens from each segment
+    if "segments" in cleaned:
+        cleaned["segments"] = [
+            {k: v for k, v in seg.items() if k != "tokens"}
+            for seg in cleaned["segments"]
+        ]
+    # Remove the text field (redundant - full text is concatenation of segment texts)
+    cleaned.pop("text", None)
+    return cleaned
+
+
 def transcribe_audio_standard(
     audio_path: Path, key_manager: RoundRobinKeyManager, logger: logging.Logger, max_retries: int = 3
 ) -> Optional[Dict[str, Any]]:
@@ -379,11 +425,9 @@ def create_output_structure(
     logger.info(f"Created output directory structure at {output_dir}")
 
 
-def get_output_paths(audio_rel_path: Path, output_dir: Path) -> Tuple[Path, Path]:
-    """Get output .txt and .json paths for an audio file."""
-    txt_path = output_dir / audio_rel_path.with_suffix(".txt")
-    json_path = output_dir / audio_rel_path.with_suffix(".json")
-    return txt_path, json_path
+def get_output_paths(audio_rel_path: Path, output_dir: Path) -> Path:
+    """Get output .json path for an audio file."""
+    return output_dir / audio_rel_path.with_suffix(".json")
 
 
 def process_file(
@@ -394,7 +438,7 @@ def process_file(
     logger: logging.Logger,
 ) -> bool:
     """Process a single audio file. Returns True if successful."""
-    txt_path, json_path = get_output_paths(rel_path, output_dir)
+    json_path = get_output_paths(rel_path, output_dir)
 
     # Check if already transcribed
     if json_path.exists():
@@ -445,16 +489,23 @@ def process_file(
                 logger.error(f"Failed to transcribe {rel_path}")
                 return False
 
-        # Save JSON with full metadata
+        # Get file metadata
+        file_metadata = get_file_metadata(audio_path)
+
+        # Strip tokens and text from transcription result
+        cleaned_result = strip_metadata_fields(merged)
+
+        # Combine file metadata with transcription
+        output_data = {
+            "file_metadata": file_metadata,
+            **cleaned_result,
+        }
+
+        # Save JSON output
         with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(merged, f, indent=2, ensure_ascii=False)
+            json.dump(output_data, f, indent=2, ensure_ascii=False)
 
-        # Save plain text
-        text = merged.get("text", "")
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(text)
-
-        logger.info(f"Saved: {txt_path} and {json_path}")
+        logger.info(f"Saved: {json_path}")
         return True
 
     except Exception as e:
