@@ -2,6 +2,7 @@
 name = "audio-transcript"
 version = "0.1.0"
 description = "Multi-provider transcription API with Flask, Redis, Groq, Mistral, and whisper.cpp fallback."
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "Flask>=3.0.0",

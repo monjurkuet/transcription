@@ -37,6 +37,12 @@ python3 -m venv .venv
 pip install -e ".[dev]"
 ```
 
+Runtime-only install:
+
+```bash
+pip install .
+```
+
 ## Configuration
 
 Create a `.env` file:
@@ -44,11 +50,13 @@ Create a `.env` file:
 ```env
 SERVICE_API_KEY=change-me
 DATABASE_URL=postgresql://postgres:password@127.0.0.1:5432/postgres
+GROQ_API_KEYS=gsk_key_1,gsk_key_2
+
 REDIS_URL=redis://127.0.0.1:6379/0
+QUEUE_NAME=audio-transcript:jobs
 STORAGE_ROOT=./data
 TRANSCRIPT_DATASET_ROOT=./transcript_dataset
 
-GROQ_API_KEYS=gsk_key_1,gsk_key_2
 MISTRAL_API_KEYS=ms_key_1,ms_key_2
 
 GROQ_MODEL=whisper-large-v3
@@ -64,8 +72,41 @@ PROVIDER_MAX_RETRIES=3
 CHUNK_DURATION_SEC=600
 CHUNK_OVERLAP_SEC=5
 MAX_FILE_SIZE_MB=25
+MAX_PARALLEL_CHUNKS=3
 JOB_RETENTION_DAYS=7
+DB_POOL_MIN_SIZE=2
+DB_POOL_MAX_SIZE=10
+DB_POOL_TIMEOUT_SEC=30
+LOG_LEVEL=INFO
 ```
+
+Required variables:
+
+| Variable | Description |
+|----------|-------------|
+| `SERVICE_API_KEY` | API key required for authenticated API routes |
+| `DATABASE_URL` | PostgreSQL connection URL using `postgres` or `postgresql` |
+| `GROQ_API_KEYS` or `MISTRAL_API_KEYS` | At least one remote provider key must be configured |
+
+Optional variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REDIS_URL` | `redis://127.0.0.1:6379/0` | Redis connection for queue and runtime state |
+| `QUEUE_NAME` | `audio-transcript:jobs` | Redis queue key prefix |
+| `STORAGE_ROOT` | `./data` | Uploaded file storage directory |
+| `TRANSCRIPT_DATASET_ROOT` | `./transcript_dataset` | Transcript parquet dataset directory |
+| `CHUNK_DURATION_SEC` | `600` | Chunk duration for large audio |
+| `CHUNK_OVERLAP_SEC` | `5` | Overlap between chunks |
+| `MAX_FILE_SIZE_MB` | `25` | Single-request size threshold before chunking |
+| `MAX_PARALLEL_CHUNKS` | `3` | Parallel chunk transcriptions |
+| `REQUEST_TIMEOUT_SEC` | `300` | Provider request timeout |
+| `PROVIDER_MAX_RETRIES` | `3` | Worker retry limit |
+| `DB_POOL_MIN_SIZE` | `2` | Postgres pool minimum size |
+| `DB_POOL_MAX_SIZE` | `10` | Postgres pool maximum size |
+| `DB_POOL_TIMEOUT_SEC` | `30` | Postgres pool acquisition timeout |
+| `WHISPER_CPP_BASE_URL` | `http://127.0.0.1:8334` | whisper.cpp server base URL |
+| `LOG_LEVEL` | `INFO` | App logging level |
 
 ## Run
 

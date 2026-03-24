@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -19,12 +20,31 @@ def _parse_csv_env(name: str) -> List[str]:
 
 def _parse_int(name: str, default: int) -> int:
     value = os.getenv(name)
-    return int(value) if value else default
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be an integer") from exc
 
 
 def _parse_float(name: str, default: float) -> float:
     value = os.getenv(name)
-    return float(value) if value else default
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be a number") from exc
+
+
+def _validate_url(value: str, name: str, allowed_schemes: List[str]) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme not in allowed_schemes:
+        raise ConfigurationError(f"{name} must use {'/'.join(allowed_schemes)} scheme")
+    if parsed.scheme in {"postgres", "postgresql", "redis", "rediss", "http", "https"} and not parsed.netloc:
+        raise ConfigurationError(f"{name} must include a host")
+    return value
 
 
 @dataclass
@@ -58,6 +78,29 @@ class Settings:
     db_pool_timeout_sec: int = 30
     max_parallel_chunks: int = 3
 
+    def validate(self) -> None:
+        _validate_url(self.database_url, "DATABASE_URL", ["postgres", "postgresql"])
+        _validate_url(self.redis_url, "REDIS_URL", ["redis", "rediss"])
+        _validate_url(self.whisper_cpp_base_url, "WHISPER_CPP_BASE_URL", ["http", "https"])
+        if self.chunk_duration_sec <= 0:
+            raise ConfigurationError("CHUNK_DURATION_SEC must be > 0")
+        if self.chunk_overlap_sec >= self.chunk_duration_sec:
+            raise ConfigurationError("CHUNK_OVERLAP_SEC must be less than CHUNK_DURATION_SEC")
+        if self.max_file_size_mb <= 0:
+            raise ConfigurationError("MAX_FILE_SIZE_MB must be > 0")
+        if self.max_parallel_chunks <= 0:
+            raise ConfigurationError("MAX_PARALLEL_CHUNKS must be > 0")
+        if self.request_timeout_sec <= 0:
+            raise ConfigurationError("REQUEST_TIMEOUT_SEC must be > 0")
+        if self.provider_max_retries <= 0:
+            raise ConfigurationError("PROVIDER_MAX_RETRIES must be > 0")
+        if self.db_pool_min_size <= 0:
+            raise ConfigurationError("DB_POOL_MIN_SIZE must be > 0")
+        if self.db_pool_max_size < self.db_pool_min_size:
+            raise ConfigurationError("DB_POOL_MAX_SIZE must be >= DB_POOL_MIN_SIZE")
+        if self.db_pool_timeout_sec <= 0:
+            raise ConfigurationError("DB_POOL_TIMEOUT_SEC must be > 0")
+
     @classmethod
     def from_env(cls) -> "Settings":
         """Load settings from env and validate them."""
@@ -80,7 +123,7 @@ class Settings:
         if not groq_api_keys and not mistral_api_keys:
             raise ConfigurationError("At least one remote provider key is required")
 
-        return cls(
+        settings = cls(
             service_api_key=service_api_key,
             database_url=database_url,
             redis_url=os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
@@ -108,3 +151,5 @@ class Settings:
             db_pool_timeout_sec=_parse_int("DB_POOL_TIMEOUT_SEC", 30),
             max_parallel_chunks=_parse_int("MAX_PARALLEL_CHUNKS", 3),
         )
+        settings.validate()
+        return settings
