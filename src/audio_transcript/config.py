@@ -56,6 +56,7 @@ class Settings:
     db_pool_min_size: int = 2
     db_pool_max_size: int = 10
     db_pool_timeout_sec: int = 30
+    max_parallel_chunks: int = 3
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -105,4 +106,5 @@ class Settings:
             db_pool_min_size=_parse_int("DB_POOL_MIN_SIZE", 2),
             db_pool_max_size=_parse_int("DB_POOL_MAX_SIZE", 10),
             db_pool_timeout_sec=_parse_int("DB_POOL_TIMEOUT_SEC", 30),
+            max_parallel_chunks=_parse_int("MAX_PARALLEL_CHUNKS", 3),
         )

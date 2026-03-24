@@ -7,6 +7,7 @@ from pathlib import Path
 
 from flask import Blueprint, current_app, jsonify, request
 
+from ..domain.errors import ValidationError
 from ..domain.models import JobPayload, JobStatus, TranscriptionJob, is_supported_audio_file
 from ..infra.storage import TranscriptArtifactStore
 from .auth import require_api_key
@@ -111,5 +112,22 @@ def get_result(job_id: str):
             jsonify({"error": {"code": "result_unavailable", "message": "Result is not ready", "details": {}}}),
             409,
         )
-    document = current_app.config["artifact_store"].load_result(job.result_path)
+    try:
+        segment_offset = int(request.args.get("segment_offset", 0))
+    except ValueError as exc:
+        raise ValidationError("segment_offset must be an integer") from exc
+    limit_arg = request.args.get("segment_limit")
+    try:
+        segment_limit = int(limit_arg) if limit_arg is not None else None
+    except ValueError as exc:
+        raise ValidationError("segment_limit must be an integer") from exc
+    if segment_offset < 0:
+        raise ValidationError("segment_offset must be >= 0")
+    if segment_limit is not None and segment_limit <= 0:
+        raise ValidationError("segment_limit must be > 0")
+    document = current_app.config["artifact_store"].load_result(
+        job.result_path,
+        segment_offset=segment_offset,
+        segment_limit=segment_limit,
+    )
     return jsonify(document)

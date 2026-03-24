@@ -181,6 +181,58 @@ def test_api_internal_errors_do_not_leak_details(tmp_path):
     assert "Traceback" not in payload["message"]
 
 
+def test_api_result_supports_segment_pagination(tmp_path):
+    app, runtime = build_test_app(tmp_path)
+    client = app.test_client()
+
+    response = client.post(
+        "/v1/jobs",
+        headers={"X-API-Key": "secret"},
+        data={"file": (io.BytesIO(b"RIFFfake"), "sample.wav")},
+        content_type="multipart/form-data",
+    )
+    job_id = response.get_json()["job"]["id"]
+    run_single_iteration(runtime)
+
+    result_response = client.get(
+        f"/v1/jobs/{job_id}/result?segment_offset=0&segment_limit=1",
+        headers={"X-API-Key": "secret"},
+    )
+    payload = result_response.get_json()
+
+    assert result_response.status_code == 200
+    assert len(payload["transcript"]["segments"]) == 1
+    assert payload["pagination"] == {"offset": 0, "limit": 1, "total": 1, "has_more": False}
+
+
+def test_api_result_rejects_invalid_pagination(tmp_path):
+    app, runtime = build_test_app(tmp_path)
+    client = app.test_client()
+
+    response = client.post(
+        "/v1/jobs",
+        headers={"X-API-Key": "secret"},
+        data={"file": (io.BytesIO(b"RIFFfake"), "sample.wav")},
+        content_type="multipart/form-data",
+    )
+    job_id = response.get_json()["job"]["id"]
+    run_single_iteration(runtime)
+
+    bad_offset = client.get(
+        f"/v1/jobs/{job_id}/result?segment_offset=-1",
+        headers={"X-API-Key": "secret"},
+    )
+    bad_limit = client.get(
+        f"/v1/jobs/{job_id}/result?segment_limit=0",
+        headers={"X-API-Key": "secret"},
+    )
+
+    assert bad_offset.status_code == 400
+    assert bad_offset.get_json()["error"]["message"] == "segment_offset must be >= 0"
+    assert bad_limit.status_code == 400
+    assert bad_limit.get_json()["error"]["message"] == "segment_limit must be > 0"
+
+
 def test_worker_retries_retryable_job_until_success(tmp_path):
     repository = InMemoryJobRepository()
     queue = InMemoryQueueBackend()

@@ -163,6 +163,7 @@ class PostgresJobRepository(JobRepository):
                 CREATE INDEX IF NOT EXISTS idx_job_attempts_job_id ON job_attempts(job_id);
                 """
             )
+            self._ensure_attempt_constraints(cur)
 
     def create(self, job: TranscriptionJob) -> None:
         self.save(job)
@@ -263,29 +264,55 @@ class PostgresJobRepository(JobRepository):
                     "file_metadata": json.dumps(file_metadata) if file_metadata else None,
                 },
             )
-            cur.execute("DELETE FROM job_attempts WHERE job_id = %s", (job.job_id,))
-            for attempt in job.attempts:
-                cur.execute(
-                    """
-                    INSERT INTO job_attempts (
-                        job_id, provider, key_id_masked, success, retryable, error, status_code,
-                        model, latency_ms, started_at, finished_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        job.job_id,
-                        attempt.provider,
-                        attempt.key_id,
-                        attempt.success,
-                        attempt.retryable,
-                        attempt.error,
-                        attempt.status_code,
-                        attempt.model,
-                        attempt.latency_ms,
-                        attempt.started_at,
-                        attempt.finished_at,
-                    ),
-                )
+            self._upsert_attempts(cur, job)
+
+    def _ensure_attempt_constraints(self, cur) -> None:
+        cur.execute(
+            """
+            DO $$
+            BEGIN
+                ALTER TABLE job_attempts
+                ADD CONSTRAINT uq_job_attempts_job_provider_started
+                UNIQUE (job_id, provider, started_at);
+            EXCEPTION
+                WHEN duplicate_object THEN NULL;
+            END
+            $$;
+            """
+        )
+
+    def _upsert_attempts(self, cur, job: TranscriptionJob) -> None:
+        for attempt in job.attempts:
+            cur.execute(
+                """
+                INSERT INTO job_attempts (
+                    job_id, provider, key_id_masked, success, retryable, error, status_code,
+                    model, latency_ms, started_at, finished_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (job_id, provider, started_at) DO UPDATE SET
+                    key_id_masked = EXCLUDED.key_id_masked,
+                    success = EXCLUDED.success,
+                    retryable = EXCLUDED.retryable,
+                    error = EXCLUDED.error,
+                    status_code = EXCLUDED.status_code,
+                    model = EXCLUDED.model,
+                    latency_ms = EXCLUDED.latency_ms,
+                    finished_at = EXCLUDED.finished_at
+                """,
+                (
+                    job.job_id,
+                    attempt.provider,
+                    attempt.key_id,
+                    attempt.success,
+                    attempt.retryable,
+                    attempt.error,
+                    attempt.status_code,
+                    attempt.model,
+                    attempt.latency_ms,
+                    attempt.started_at,
+                    attempt.finished_at,
+                ),
+            )
 
     def list_jobs(
         self,

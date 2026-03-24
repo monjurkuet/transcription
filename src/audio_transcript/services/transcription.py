@@ -6,9 +6,10 @@ import logging
 import mimetypes
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ..config import Settings
 from ..domain.errors import NonRetryableProviderError, RetryableProviderError, ValidationError
@@ -43,6 +44,15 @@ class RuntimeDependencies:
     chunker: AudioChunker
 
 
+class _TranscriptionExecutionError(Exception):
+    """Internal wrapper that preserves attempts generated before failure."""
+
+    def __init__(self, cause: Exception, attempts: List[ProviderAttempt]):
+        super().__init__(str(cause))
+        self.cause = cause
+        self.attempts = attempts
+
+
 class TranscriptionService:
     """Coordinates job execution."""
 
@@ -72,7 +82,8 @@ class TranscriptionService:
             file_metadata = self.deps.inspector.get_file_metadata(audio_path)
             job.file_metadata = file_metadata
 
-            transcript = self._transcribe(audio_path, job)
+            transcript, attempts = self._transcribe(audio_path, job)
+            job.attempts.extend(attempts)
             job.status = JobStatus.SUCCEEDED
             job.completed_at = utcnow()
             job.provider = transcript.provider
@@ -83,6 +94,23 @@ class TranscriptionService:
             job.result_path = result_path
             self.deps.repository.save(job)
             return job
+        except _TranscriptionExecutionError as exc:
+            if job is not None:
+                job.attempts.extend(exc.attempts)
+            if isinstance(exc.cause, RetryableProviderError):
+                if job is not None:
+                    job.status = JobStatus.QUEUED
+                    job.started_at = None
+                    job.completed_at = None
+                    job.error = str(exc.cause)
+                    self.deps.repository.save(job)
+                raise exc.cause
+            if job is not None:
+                job.status = JobStatus.FAILED
+                job.completed_at = utcnow()
+                job.error = str(exc.cause)
+                self.deps.repository.save(job)
+            raise exc.cause
         except RetryableProviderError as exc:
             if job is not None:
                 job.status = JobStatus.QUEUED
@@ -101,51 +129,102 @@ class TranscriptionService:
         finally:
             self.deps.runtime_state.release_job_lock(job_id)
 
-    def _transcribe(self, audio_path: Path, job: TranscriptionJob) -> TranscriptResult:
+    def _transcribe(self, audio_path: Path, job: TranscriptionJob) -> Tuple[TranscriptResult, List[ProviderAttempt]]:
         file_size_mb = audio_path.stat().st_size / (1024 * 1024)
         chunk_duration = job.payload.chunk_duration_sec or self.deps.settings.chunk_duration_sec
         chunk_overlap = job.payload.chunk_overlap_sec or self.deps.settings.chunk_overlap_sec
 
         if file_size_mb <= self.deps.settings.max_file_size_mb:
-            return self._transcribe_single(audio_path, job.payload.content_type, job.payload.model_override, job)
+            return self._transcribe_single_with_attempts(audio_path, job.payload.content_type, job.payload.model_override)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             chunk_paths = self.deps.chunker.chunk_audio(audio_path, Path(temp_dir), chunk_duration, chunk_overlap)
-            chunk_results = [
-                self._transcribe_single(chunk_path, "audio/wav", job.payload.model_override, job)
-                for chunk_path in chunk_paths
-            ]
-        return merge_transcripts(chunk_results, chunk_overlap)
+            chunk_results, attempts = self._transcribe_chunks_parallel(chunk_paths, job.payload.model_override)
+        return merge_transcripts(chunk_results, chunk_overlap), attempts
 
-    def _transcribe_single(
+    def _transcribe_single_with_attempts(
         self,
         audio_path: Path,
         content_type: str,
         model_override: Optional[str],
-        job: TranscriptionJob,
-    ) -> TranscriptResult:
+    ) -> Tuple[TranscriptResult, List[ProviderAttempt]]:
         remote_order = self.deps.router.select_remote_order(
             {name: True for name in self.deps.remote_providers.keys()}
         )
         errors: List[str] = []
+        attempts: List[ProviderAttempt] = []
         for provider_name in remote_order:
             provider = self.deps.remote_providers[provider_name]
             try:
-                return self._run_provider(provider, audio_path, content_type, model_override, job)
+                return self._run_provider(provider, audio_path, content_type, model_override, attempts), attempts
             except NonRetryableProviderError as exc:
                 errors.append(str(exc))
-                raise
+                raise _TranscriptionExecutionError(exc, attempts) from exc
             except (RetryableProviderError, RuntimeError) as exc:
                 errors.append(str(exc))
                 continue
 
         if self.deps.fallback_provider:
             try:
-                return self._run_provider(self.deps.fallback_provider, audio_path, content_type, model_override, job)
+                return (
+                    self._run_provider(self.deps.fallback_provider, audio_path, content_type, model_override, attempts),
+                    attempts,
+                )
             except Exception as exc:
                 errors.append(str(exc))
 
-        raise RetryableProviderError("; ".join(errors) or "No provider succeeded")
+        failure = RetryableProviderError("; ".join(errors) or "No provider succeeded")
+        raise _TranscriptionExecutionError(failure, attempts)
+
+    def _transcribe_chunks_parallel(
+        self,
+        chunk_paths: List[Path],
+        model_override: Optional[str],
+    ) -> Tuple[List[TranscriptResult], List[ProviderAttempt]]:
+        if not chunk_paths:
+            return [], []
+
+        max_workers = max(1, min(self.deps.settings.max_parallel_chunks, len(chunk_paths)))
+        results: Dict[int, TranscriptResult] = {}
+        attempts_by_index: Dict[int, List[ProviderAttempt]] = {}
+        failures: List[Tuple[int, Exception, List[ProviderAttempt]]] = []
+
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="chunk-transcribe") as executor:
+            future_to_index = {
+                executor.submit(self._transcribe_single_with_attempts, chunk_path, "audio/wav", model_override): index
+                for index, chunk_path in enumerate(chunk_paths)
+            }
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    result, attempts = future.result()
+                    results[index] = result
+                    attempts_by_index[index] = attempts
+                except _TranscriptionExecutionError as exc:
+                    failures.append((index, exc.cause, exc.attempts))
+
+        if failures:
+            failures.sort(key=lambda item: item[0])
+            ordered_attempts = self._flatten_attempts(attempts_by_index, failures)
+            non_retryable = next((item for item in failures if isinstance(item[1], NonRetryableProviderError)), None)
+            chosen = non_retryable or failures[0]
+            raise _TranscriptionExecutionError(chosen[1], ordered_attempts)
+
+        ordered_attempts = self._flatten_attempts(attempts_by_index)
+        ordered_results = [results[index] for index in range(len(chunk_paths))]
+        return ordered_results, ordered_attempts
+
+    def _flatten_attempts(
+        self,
+        attempts_by_index: Dict[int, List[ProviderAttempt]],
+        failures: Optional[List[Tuple[int, Exception, List[ProviderAttempt]]]] = None,
+    ) -> List[ProviderAttempt]:
+        ordered: List[ProviderAttempt] = []
+        failure_map = {index: attempts for index, _, attempts in failures or []}
+        for index in sorted(set(attempts_by_index) | set(failure_map)):
+            ordered.extend(attempts_by_index.get(index, []))
+            ordered.extend(failure_map.get(index, []))
+        return ordered
 
     def _run_provider(
         self,
@@ -153,7 +232,7 @@ class TranscriptionService:
         audio_path: Path,
         content_type: str,
         model_override: Optional[str],
-        job: TranscriptionJob,
+        attempts: List[ProviderAttempt],
     ) -> TranscriptResult:
         attempt = ProviderAttempt(
             provider=provider.provider_name,
@@ -181,5 +260,4 @@ class TranscriptionService:
         finally:
             attempt.finished_at = utcnow()
             attempt.latency_ms = int((time.monotonic() - start) * 1000)
-            job.attempts.append(attempt)
-            self.deps.repository.save(job)
+            attempts.append(attempt)

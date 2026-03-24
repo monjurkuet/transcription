@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterator, List, Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -68,7 +68,12 @@ class TranscriptArtifactStore:
         pq.write_table(pa.Table.from_pylist([summary_row]), summary_path)
         return str(artifact_dir)
 
-    def load_result(self, artifact_uri: str | Path) -> Dict[str, Any]:
+    def load_result(
+        self,
+        artifact_uri: str | Path,
+        segment_offset: int = 0,
+        segment_limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
         artifact_dir = Path(artifact_uri)
         if artifact_dir.is_file() and artifact_dir.suffix.lower() == ".json":
             with open(artifact_dir, "r", encoding="utf-8") as handle:
@@ -82,9 +87,10 @@ class TranscriptArtifactStore:
         if not summary_rows:
             raise ArtifactNotFoundError(f"Empty summary artifact under {artifact_dir}")
         summary = summary_rows[0]
-        segments = pq.ParquetFile(segments_path).read().to_pylist()
+        segments = list(self._iter_segments(segments_path, offset=segment_offset, limit=segment_limit))
+        total_segments = summary.get("segment_count", len(segments))
 
-        return {
+        result = {
             "job": {
                 "id": summary["job_id"],
                 "status": summary["status"],
@@ -108,10 +114,44 @@ class TranscriptArtifactStore:
                 "text": summary["text"],
                 "provider": summary["provider"],
                 "model": summary["model"],
-                "segments": [self._segment_to_result_item(index, row) for index, row in enumerate(segments)],
+                "segments": segments,
             },
             "attempts": json.loads(summary["attempts_json"]),
         }
+        if segment_offset > 0 or segment_limit is not None:
+            result["pagination"] = {
+                "offset": segment_offset,
+                "limit": segment_limit,
+                "total": total_segments,
+                "has_more": segment_offset + len(segments) < total_segments,
+            }
+        return result
+
+    def _iter_segments(
+        self,
+        segments_path: Path,
+        offset: int = 0,
+        limit: Optional[int] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        yielded = 0
+        current_index = 0
+        max_items = limit if limit is not None else None
+        parquet = pq.ParquetFile(segments_path)
+
+        for batch in parquet.iter_batches(batch_size=1000):
+            for row in batch.to_pylist():
+                if row.get("segment_index", -1) < 0:
+                    continue
+                if current_index < offset:
+                    current_index += 1
+                    continue
+                if max_items is not None and yielded >= max_items:
+                    return
+                segment = self._segment_to_result_item(current_index, row)
+                if segment:
+                    yield segment
+                    yielded += 1
+                current_index += 1
 
     def _segment_rows(
         self,
