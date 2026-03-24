@@ -2,7 +2,8 @@ import io
 
 from audio_transcript.api.app import create_app
 from audio_transcript.config import Settings
-from audio_transcript.domain.models import TranscriptResult, TranscriptSegment
+from audio_transcript.domain.errors import NonRetryableProviderError, RetryableProviderError
+from audio_transcript.domain.models import JobStatus, TranscriptResult, TranscriptSegment
 from audio_transcript.infra.queue import InMemoryQueueBackend
 from audio_transcript.infra.repository import InMemoryJobRepository
 from audio_transcript.infra.runtime_state import InMemoryRuntimeState
@@ -10,7 +11,7 @@ from audio_transcript.infra.storage import TranscriptArtifactStore
 from audio_transcript.services.audio import AudioChunker
 from audio_transcript.services.router import ProviderRouter
 from audio_transcript.services.transcription import RuntimeDependencies, TranscriptionService
-from audio_transcript.worker.runner import run_single_iteration
+from audio_transcript.worker.runner import calculate_backoff, run_single_iteration
 
 
 class FakeInspector:
@@ -39,10 +40,16 @@ class FakeChunker(AudioChunker):
 
 
 class FakeProvider:
-    def __init__(self, name):
+    def __init__(self, name, outcomes=None):
         self.provider_name = name
+        self.outcomes = list(outcomes or [])
 
     def transcribe(self, audio_path, content_type, model_override=None):
+        if self.outcomes:
+            outcome = self.outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
         return TranscriptResult(
             text=f"{self.provider_name} text",
             segments=[TranscriptSegment(start=0.0, end=1.0, text=f"{self.provider_name} text")],
@@ -92,7 +99,13 @@ def build_test_app(tmp_path):
         providers=providers,
         fallback_provider=FakeProvider("whisper_cpp"),
     )
-    return app, {"repository": repository, "queue": queue, "service": service, "artifact_store": store}
+    return app, {
+        "settings": settings,
+        "repository": repository,
+        "queue": queue,
+        "service": service,
+        "artifact_store": store,
+    }
 
 
 def test_api_job_lifecycle(tmp_path):
@@ -148,3 +161,248 @@ def test_api_lists_jobs_with_search(tmp_path):
     jobs = response.get_json()["jobs"]
     assert len(jobs) == 1
     assert jobs[0]["id"] == job_id
+
+
+def test_api_internal_errors_do_not_leak_details(tmp_path):
+    app, _ = build_test_app(tmp_path)
+
+    @app.get("/boom")
+    def boom():
+        raise RuntimeError("/home/test Traceback secret")
+
+    client = app.test_client()
+    response = client.get("/boom")
+
+    assert response.status_code == 500
+    payload = response.get_json()["error"]
+    assert payload["code"] == "internal_error"
+    assert payload["message"] == "An unexpected error occurred"
+    assert "/home/test" not in payload["message"]
+    assert "Traceback" not in payload["message"]
+
+
+def test_worker_retries_retryable_job_until_success(tmp_path):
+    repository = InMemoryJobRepository()
+    queue = InMemoryQueueBackend()
+    runtime_state = InMemoryRuntimeState()
+    store = TranscriptArtifactStore(tmp_path / "artifacts", tmp_path / "dataset")
+    settings = Settings(
+        service_api_key="secret",
+        database_url="postgresql://unused",
+        redis_url="redis://unused",
+        storage_root=tmp_path / "artifacts",
+        transcript_dataset_root=tmp_path / "dataset",
+        groq_api_keys=["gsk_1"],
+        mistral_api_keys=[],
+        provider_max_retries=3,
+    )
+    provider = FakeProvider(
+        "groq",
+        outcomes=[
+            RetryableProviderError("temporary 1"),
+            RetryableProviderError("temporary 2"),
+            TranscriptResult(
+                text="groq text",
+                segments=[TranscriptSegment(start=0.0, end=1.0, text="groq text")],
+                provider="groq",
+            ),
+        ],
+    )
+    service = TranscriptionService(
+        RuntimeDependencies(
+            settings=settings,
+            repository=repository,
+            artifact_store=store,
+            runtime_state=runtime_state,
+            router=ProviderRouter(["groq"]),
+            remote_providers={"groq": provider},
+            fallback_provider=None,
+            inspector=FakeInspector(),
+            chunker=FakeChunker(),
+        )
+    )
+    runtime = {
+        "settings": settings,
+        "repository": repository,
+        "queue": queue,
+        "service": service,
+        "artifact_store": store,
+    }
+    response = create_app(
+        settings,
+        repository=repository,
+        queue=queue,
+        artifact_store=store,
+        runtime_state=runtime_state,
+        service=service,
+        providers={"groq": provider},
+        fallback_provider=None,
+    ).test_client().post(
+        "/v1/jobs",
+        headers={"X-API-Key": "secret"},
+        data={"file": (io.BytesIO(b"RIFFfake"), "sample.wav")},
+        content_type="multipart/form-data",
+    )
+    job_id = response.get_json()["job"]["id"]
+
+    sleeps = []
+    assert run_single_iteration(runtime, sleep_fn=sleeps.append) is True
+    assert queue.get_retry_count(job_id) == 1
+    assert sleeps == [2]
+    assert repository.get(job_id).status == JobStatus.QUEUED
+
+    assert run_single_iteration(runtime, sleep_fn=sleeps.append) is True
+    assert queue.get_retry_count(job_id) == 2
+    assert sleeps == [2, 4]
+
+    assert run_single_iteration(runtime, sleep_fn=sleeps.append) is True
+    job = repository.get(job_id)
+    assert job.status == JobStatus.SUCCEEDED
+    assert queue.get_retry_count(job_id) == 0
+    assert queue.get_dlq_jobs() == []
+
+
+def test_worker_moves_non_retryable_job_to_dlq(tmp_path):
+    repository = InMemoryJobRepository()
+    queue = InMemoryQueueBackend()
+    runtime_state = InMemoryRuntimeState()
+    store = TranscriptArtifactStore(tmp_path / "artifacts", tmp_path / "dataset")
+    settings = Settings(
+        service_api_key="secret",
+        database_url="postgresql://unused",
+        redis_url="redis://unused",
+        storage_root=tmp_path / "artifacts",
+        transcript_dataset_root=tmp_path / "dataset",
+        groq_api_keys=["gsk_1"],
+        mistral_api_keys=[],
+    )
+    provider = FakeProvider("groq", outcomes=[NonRetryableProviderError("bad audio")])
+    service = TranscriptionService(
+        RuntimeDependencies(
+            settings=settings,
+            repository=repository,
+            artifact_store=store,
+            runtime_state=runtime_state,
+            router=ProviderRouter(["groq"]),
+            remote_providers={"groq": provider},
+            fallback_provider=None,
+            inspector=FakeInspector(),
+            chunker=FakeChunker(),
+        )
+    )
+    client = create_app(
+        settings,
+        repository=repository,
+        queue=queue,
+        artifact_store=store,
+        runtime_state=runtime_state,
+        service=service,
+        providers={"groq": provider},
+        fallback_provider=None,
+    ).test_client()
+    response = client.post(
+        "/v1/jobs",
+        headers={"X-API-Key": "secret"},
+        data={"file": (io.BytesIO(b"RIFFfake"), "sample.wav")},
+        content_type="multipart/form-data",
+    )
+    job_id = response.get_json()["job"]["id"]
+
+    runtime = {
+        "settings": settings,
+        "repository": repository,
+        "queue": queue,
+        "service": service,
+        "artifact_store": store,
+    }
+    assert run_single_iteration(runtime, sleep_fn=lambda _: None) is True
+    job = repository.get(job_id)
+    assert job.status == JobStatus.FAILED
+    assert queue.get_retry_count(job_id) == 0
+    dlq = queue.get_dlq_jobs()
+    assert len(dlq) == 1
+    assert dlq[0]["job_id"] == job_id
+    assert dlq[0]["error"] == "bad audio"
+
+
+def test_worker_moves_retry_exhausted_job_to_dlq(tmp_path):
+    repository = InMemoryJobRepository()
+    queue = InMemoryQueueBackend()
+    runtime_state = InMemoryRuntimeState()
+    store = TranscriptArtifactStore(tmp_path / "artifacts", tmp_path / "dataset")
+    settings = Settings(
+        service_api_key="secret",
+        database_url="postgresql://unused",
+        redis_url="redis://unused",
+        storage_root=tmp_path / "artifacts",
+        transcript_dataset_root=tmp_path / "dataset",
+        groq_api_keys=["gsk_1"],
+        mistral_api_keys=[],
+        provider_max_retries=3,
+    )
+    provider = FakeProvider(
+        "groq",
+        outcomes=[
+            RetryableProviderError("temporary 1"),
+            RetryableProviderError("temporary 2"),
+            RetryableProviderError("temporary 3"),
+        ],
+    )
+    service = TranscriptionService(
+        RuntimeDependencies(
+            settings=settings,
+            repository=repository,
+            artifact_store=store,
+            runtime_state=runtime_state,
+            router=ProviderRouter(["groq"]),
+            remote_providers={"groq": provider},
+            fallback_provider=None,
+            inspector=FakeInspector(),
+            chunker=FakeChunker(),
+        )
+    )
+    client = create_app(
+        settings,
+        repository=repository,
+        queue=queue,
+        artifact_store=store,
+        runtime_state=runtime_state,
+        service=service,
+        providers={"groq": provider},
+        fallback_provider=None,
+    ).test_client()
+    response = client.post(
+        "/v1/jobs",
+        headers={"X-API-Key": "secret"},
+        data={"file": (io.BytesIO(b"RIFFfake"), "sample.wav")},
+        content_type="multipart/form-data",
+    )
+    job_id = response.get_json()["job"]["id"]
+    runtime = {
+        "settings": settings,
+        "repository": repository,
+        "queue": queue,
+        "service": service,
+        "artifact_store": store,
+    }
+
+    sleeps = []
+    assert run_single_iteration(runtime, sleep_fn=sleeps.append) is True
+    assert run_single_iteration(runtime, sleep_fn=sleeps.append) is True
+    assert run_single_iteration(runtime, sleep_fn=sleeps.append) is True
+
+    job = repository.get(job_id)
+    assert job.status == JobStatus.FAILED
+    assert job.error == "Retry limit exceeded"
+    assert queue.get_retry_count(job_id) == 0
+    assert sleeps == [2, 4]
+    dlq = queue.get_dlq_jobs()
+    assert len(dlq) == 1
+    assert dlq[0]["job_id"] == job_id
+    assert dlq[0]["retry_count"] == 3
+
+
+def test_calculate_backoff_grows_exponentially():
+    assert calculate_backoff(1) == 2
+    assert calculate_backoff(2) == 4
+    assert calculate_backoff(3) == 8

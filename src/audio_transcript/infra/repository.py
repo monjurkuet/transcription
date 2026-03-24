@@ -4,10 +4,57 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 import psycopg
 from psycopg.rows import dict_row
+
+try:
+    from psycopg_pool import ConnectionPool
+except ImportError:  # pragma: no cover - exercised only when the pool extra is absent
+    class ConnectionPool:
+        """Small compatibility wrapper when psycopg_pool is unavailable."""
+
+        def __init__(
+            self,
+            conninfo: str,
+            min_size: int = 2,
+            max_size: int = 10,
+            timeout: int = 30,
+            kwargs: Optional[Dict[str, Any]] = None,
+        ):
+            self.conninfo = conninfo
+            self.min_size = min_size
+            self.max_size = max_size
+            self.timeout = timeout
+            self.kwargs = kwargs or {}
+            self._idle: List[Any] = []
+            self._checked_out = 0
+
+        @contextmanager
+        def connection(self):
+            conn = self._idle.pop() if self._idle else psycopg.connect(self.conninfo, **self.kwargs)
+            self._checked_out += 1
+            try:
+                yield conn
+            finally:
+                self._checked_out -= 1
+                if len(self._idle) < self.max_size:
+                    self._idle.append(conn)
+                else:
+                    conn.close()
+
+        def get_stats(self) -> Dict[str, int]:
+            pool_size = len(self._idle) + self._checked_out
+            return {
+                "pool_size": max(pool_size, self.min_size if pool_size else 0),
+                "pool_available": len(self._idle),
+            }
+
+        def close(self) -> None:
+            while self._idle:
+                self._idle.pop().close()
 
 from ..domain.errors import JobNotFoundError
 from ..domain.models import FileMetadata, JobStatus, ProviderAttempt, TranscriptionJob
@@ -48,15 +95,24 @@ class JobRepository(ABC):
 class PostgresJobRepository(JobRepository):
     """Postgres-backed durable job repository."""
 
-    def __init__(self, database_url: str):
+    def __init__(self, database_url: str, min_size: int = 2, max_size: int = 10, timeout_sec: int = 30):
         self.database_url = database_url
+        self._pool = ConnectionPool(
+            conninfo=database_url,
+            min_size=min_size,
+            max_size=max_size,
+            timeout=timeout_sec,
+            kwargs={"row_factory": dict_row},
+        )
         self._ensure_schema()
 
-    def _connect(self):
-        return psycopg.connect(self.database_url, row_factory=dict_row)
+    @contextmanager
+    def _connection(self):
+        with self._pool.connection() as conn:
+            yield conn
 
     def _ensure_schema(self) -> None:
-        with self._connect() as conn, conn.cursor() as cur:
+        with self._connection() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS jobs (
@@ -112,7 +168,7 @@ class PostgresJobRepository(JobRepository):
         self.save(job)
 
     def get(self, job_id: str) -> TranscriptionJob:
-        with self._connect() as conn, conn.cursor() as cur:
+        with self._connection() as conn, conn.cursor() as cur:
             cur.execute("SELECT * FROM jobs WHERE job_id = %s", (job_id,))
             row = cur.fetchone()
             if row is None:
@@ -135,7 +191,7 @@ class PostgresJobRepository(JobRepository):
             summary_text = getattr(job, "summary_text", None)
             segment_count = getattr(job, "segment_count", None)
 
-        with self._connect() as conn, conn.cursor() as cur:
+        with self._connection() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO jobs (
@@ -256,7 +312,7 @@ class PostgresJobRepository(JobRepository):
             params.append(f"%{search}%")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
-        with self._connect() as conn, conn.cursor() as cur:
+        with self._connection() as conn, conn.cursor() as cur:
             cur.execute(
                 f"SELECT * FROM jobs {where} ORDER BY created_at DESC LIMIT %s",
                 params,
@@ -281,10 +337,18 @@ class PostgresJobRepository(JobRepository):
         return [self._job_from_rows(row, attempt_map.get(row["job_id"], [])) for row in rows]
 
     def healthcheck(self) -> Dict[str, str]:
-        with self._connect() as conn, conn.cursor() as cur:
+        with self._connection() as conn, conn.cursor() as cur:
             cur.execute("SELECT 1")
             cur.fetchone()
-        return {"postgres": "ok"}
+        stats = self._pool.get_stats()
+        return {
+            "postgres": "ok",
+            "postgres_pool_size": str(stats.get("pool_size", 0)),
+            "postgres_pool_available": str(stats.get("pool_available", 0)),
+        }
+
+    def close(self) -> None:
+        self._pool.close()
 
     def _job_from_rows(self, row: Dict[str, Any], attempt_rows: List[Dict[str, Any]]) -> TranscriptionJob:
         file_metadata = row["file_metadata"]

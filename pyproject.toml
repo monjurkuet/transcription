@@ -5,7 +5,7 @@ description = "Multi-provider transcription API with Flask, Redis, Groq, Mistral
 requires-python = ">=3.10"
 dependencies = [
   "Flask>=3.0.0",
-  "psycopg[binary]>=3.2.0",
+  "psycopg[binary,pool]>=3.2.0",
   "pyarrow>=18.0.0",
   "python-dotenv>=1.0.0",
   "redis>=5.0.0",

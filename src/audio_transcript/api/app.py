@@ -28,7 +28,12 @@ def build_runtime(settings: Settings):
     redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
     if not settings.database_url:
         raise ConfigurationError("DATABASE_URL is required")
-    repository: JobRepository = PostgresJobRepository(settings.database_url)
+    repository: JobRepository = PostgresJobRepository(
+        settings.database_url,
+        min_size=settings.db_pool_min_size,
+        max_size=settings.db_pool_max_size,
+        timeout_sec=settings.db_pool_timeout_sec,
+    )
     queue: QueueBackend = RedisQueueBackend(redis_client, settings.queue_name)
     runtime_state = RedisRuntimeState(redis_client)
     artifact_store = TranscriptArtifactStore(settings.storage_root, settings.transcript_dataset_root)

@@ -83,6 +83,14 @@ class TranscriptionService:
             job.result_path = result_path
             self.deps.repository.save(job)
             return job
+        except RetryableProviderError as exc:
+            if job is not None:
+                job.status = JobStatus.QUEUED
+                job.started_at = None
+                job.completed_at = None
+                job.error = str(exc)
+                self.deps.repository.save(job)
+            raise
         except Exception as exc:
             if job is not None:
                 job.status = JobStatus.FAILED

@@ -33,3 +33,28 @@ def test_whisper_cpp_request_error_is_retryable(tmp_path):
             assert "boom" in str(exc)
         else:
             raise AssertionError("expected RetryableProviderError")
+
+
+def test_whisper_cpp_uses_shared_segment_parser(tmp_path):
+    provider = WhisperCppProvider("http://127.0.0.1:8334", 30, 0.0, 0.2)
+    sample = tmp_path / "sample.wav"
+    sample.write_bytes(b"RIFFfake")
+    response = Mock(status_code=200, text="ok", headers={})
+    response.json.return_value = {
+        "result": "hello",
+        "segments": [
+            {
+                "id": 0,
+                "start": 0.0,
+                "end": 1.0,
+                "text": "hello",
+                "avg_logprob": -0.5,
+            }
+        ],
+    }
+
+    with patch("audio_transcript.infra.providers.whisper_cpp.requests.post", return_value=response):
+        result = provider.transcribe(sample, "audio/wav")
+
+    assert result.text == "hello"
+    assert result.segments[0].provider_data == {"avg_logprob": -0.5}

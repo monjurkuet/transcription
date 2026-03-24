@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+
 from flask import jsonify
 
 from ..domain.errors import AudioTranscriptError, JobNotFoundError, ValidationError
+
+logger = logging.getLogger("audio_transcript.api.errors")
 
 
 def register_error_handlers(app) -> None:
@@ -22,8 +26,10 @@ def register_error_handlers(app) -> None:
 
     @app.errorhandler(AudioTranscriptError)
     def handle_domain(exc):
-        return jsonify({"error": {"code": "application_error", "message": str(exc), "details": {}}}), 500
+        logger.exception("Application error")
+        return jsonify({"error": {"code": "application_error", "message": "An application error occurred", "details": {}}}), 500
 
     @app.errorhandler(Exception)
     def handle_unexpected(exc):
-        return jsonify({"error": {"code": "internal_error", "message": str(exc), "details": {}}}), 500
+        logger.exception("Unexpected error")
+        return jsonify({"error": {"code": "internal_error", "message": "An unexpected error occurred", "details": {}}}), 500

@@ -7,8 +7,8 @@ from typing import Any, Dict, Optional
 
 import requests
 
-from ...domain.models import TranscriptResult, TranscriptSegment
-from .base import TranscriptionProvider, coerce_provider_error
+from ...domain.models import TranscriptResult
+from .base import TranscriptionProvider, coerce_provider_error, parse_segments
 
 
 class WhisperCppProvider(TranscriptionProvider):
@@ -64,19 +64,9 @@ class WhisperCppProvider(TranscriptionProvider):
             raise coerce_provider_error(response.status_code, f"whisper.cpp inference failed: {response.text}")
 
         payload = response.json()
-        segments = [
-            TranscriptSegment(
-                id=segment.get("id"),
-                start=float(segment.get("start", 0.0)),
-                end=float(segment.get("end", 0.0)),
-                text=segment.get("text", ""),
-                provider_data={k: v for k, v in segment.items() if k not in {"id", "start", "end", "text"}},
-            )
-            for segment in payload.get("segments", [])
-        ]
         return TranscriptResult(
             text=payload.get("text", payload.get("result", "")),
-            segments=segments,
+            segments=parse_segments(payload),
             provider=self.provider_name,
             model=model_override,
             raw=payload,

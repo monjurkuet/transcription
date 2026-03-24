@@ -53,6 +53,9 @@ class Settings:
     job_retention_days: int = 7
     queue_name: str = "audio-transcript:jobs"
     dynamic_whisper_cpp_load: bool = False
+    db_pool_min_size: int = 2
+    db_pool_max_size: int = 10
+    db_pool_timeout_sec: int = 30
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -99,4 +102,7 @@ class Settings:
             job_retention_days=_parse_int("JOB_RETENTION_DAYS", 7),
             queue_name=os.getenv("QUEUE_NAME", "audio-transcript:jobs"),
             dynamic_whisper_cpp_load=os.getenv("DYNAMIC_WHISPER_CPP_LOAD", "false").lower() == "true",
+            db_pool_min_size=_parse_int("DB_POOL_MIN_SIZE", 2),
+            db_pool_max_size=_parse_int("DB_POOL_MAX_SIZE", 10),
+            db_pool_timeout_sec=_parse_int("DB_POOL_TIMEOUT_SEC", 30),
         )
