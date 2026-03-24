@@ -76,6 +76,10 @@ class JobRepository(ABC):
         """Persist a job."""
 
     @abstractmethod
+    def find_latest_by_source_path(self, source_path: str) -> Optional[TranscriptionJob]:
+        """Return the most recent job for an exact normalized source path."""
+
+    @abstractmethod
     def list_jobs(
         self,
         *,
@@ -266,6 +270,32 @@ class PostgresJobRepository(JobRepository):
             )
             self._upsert_attempts(cur, job)
 
+    def find_latest_by_source_path(self, source_path: str) -> Optional[TranscriptionJob]:
+        with self._connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM jobs
+                WHERE source_path = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (source_path,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            cur.execute(
+                """
+                SELECT provider, key_id_masked, success, retryable, error, status_code, model, latency_ms, started_at, finished_at
+                FROM job_attempts
+                WHERE job_id = %s
+                ORDER BY id
+                """,
+                (row["job_id"],),
+            )
+            attempt_rows = cur.fetchall()
+        return self._job_from_rows(row, attempt_rows)
+
     def _ensure_attempt_constraints(self, cur) -> None:
         cur.execute(
             """
@@ -450,6 +480,13 @@ class InMemoryJobRepository(JobRepository):
 
     def save(self, job: TranscriptionJob) -> None:
         self.items[job.job_id] = TranscriptionJob.from_record(job.to_record())
+
+    def find_latest_by_source_path(self, source_path: str) -> Optional[TranscriptionJob]:
+        matches = [job for job in self.items.values() if job.payload.source_path == source_path]
+        if not matches:
+            return None
+        latest = max(matches, key=lambda item: item.created_at)
+        return TranscriptionJob.from_record(latest.to_record())
 
     def list_jobs(
         self,

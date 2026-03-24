@@ -15,7 +15,7 @@ from audio_transcript.logging_utils import (
     set_request_context,
 )
 from audio_transcript.services.router import ProviderRouter
-from audio_transcript.services.transcription import RuntimeDependencies, TranscriptionService
+from audio_transcript.services.transcription import DirectoryScanService, RuntimeDependencies, TranscriptionService
 from audio_transcript.worker.runner import run_single_iteration
 from conftest import FakeChunker, FakeInspector, FakeProvider
 
@@ -168,3 +168,25 @@ def test_worker_terminal_logs_include_job_id(tmp_path):
     events = _log_lines(stream)
     assert any(item["event"] == "job_failed" and item["job_id"] == "job-failed" for item in events)
     assert any(item["event"] == "worker_job_failed" and item["job_id"] == "job-failed" for item in events)
+
+
+def test_directory_scan_logs_summary_counts(tmp_path):
+    stream = io.StringIO()
+    configure_logging(log_format="json", stream=stream)
+    repository = InMemoryJobRepository()
+    queue = InMemoryQueueBackend()
+    service = DirectoryScanService(repository, queue)
+    root = tmp_path / "scan"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    (root / "a.wav").write_bytes(b"RIFFfake")
+    (nested / "ignore.txt").write_text("ignore")
+
+    service.scan_directory(str(root))
+
+    events = _log_lines(stream)
+    summary = next(item for item in events if item["event"] == "scan_completed")
+    assert summary["directory_path"] == str(root.resolve())
+    assert summary["discovered"] == 2
+    assert summary["queued"] == 1
+    assert summary["unsupported"] == 1

@@ -4,7 +4,7 @@ import audio_transcript.api.routes as route_module
 from audio_transcript.api.app import create_app
 from audio_transcript.config import Settings
 from audio_transcript.domain.errors import AudioProcessingError, NonRetryableProviderError, RetryableProviderError, StorageError
-from audio_transcript.domain.models import JobStatus, TranscriptResult, TranscriptSegment
+from audio_transcript.domain.models import JobPayload, JobStatus, TranscriptionJob, TranscriptResult, TranscriptSegment
 from audio_transcript.infra.queue import InMemoryQueueBackend
 from audio_transcript.infra.repository import InMemoryJobRepository
 from audio_transcript.infra.runtime_state import InMemoryRuntimeState
@@ -234,6 +234,188 @@ def test_api_generates_request_id_header(tmp_path):
 
     assert response.status_code == 200
     assert response.headers["X-Request-ID"]
+
+
+def test_api_scan_directory_recurses_and_queues_nested_audio_files(tmp_path):
+    app, runtime = build_test_app(tmp_path)
+    client = app.test_client()
+    root = tmp_path / "scan-root"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    (root / "a.wav").write_bytes(b"RIFFfake")
+    (nested / "b.mp3").write_bytes(b"ID3")
+    (nested / "notes.txt").write_text("ignore")
+
+    response = client.post(
+        "/v1/jobs/scan",
+        headers={"X-API-Key": "secret"},
+        json={"directory_path": str(root)},
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 202
+    assert payload["scan"]["directory_path"] == str(root.resolve())
+    assert payload["scan"]["recursive"] is True
+    assert payload["scan"]["discovered"] == 3
+    assert payload["scan"]["queued"] == 2
+    assert payload["scan"]["unsupported"] == 1
+    assert payload["scan"]["skipped_succeeded"] == 0
+    assert [job["filename"] for job in payload["jobs"]] == ["a.wav", "b.mp3"]
+    assert len(runtime["queue"].items) == 2
+
+
+def test_api_scan_directory_requires_directory_path(tmp_path):
+    app, _ = build_test_app(tmp_path)
+    client = app.test_client()
+
+    response = client.post("/v1/jobs/scan", headers={"X-API-Key": "secret"}, json={})
+
+    assert response.status_code == 400
+    assert response.get_json()["error"]["message"] == "directory_path is required"
+
+
+def test_api_scan_directory_rejects_missing_directory(tmp_path):
+    app, _ = build_test_app(tmp_path)
+    client = app.test_client()
+
+    response = client.post(
+        "/v1/jobs/scan",
+        headers={"X-API-Key": "secret"},
+        json={"directory_path": str(tmp_path / "missing")},
+    )
+
+    assert response.status_code == 400
+    assert "Directory does not exist" in response.get_json()["error"]["message"]
+
+
+def test_api_scan_directory_rejects_file_path(tmp_path):
+    app, _ = build_test_app(tmp_path)
+    client = app.test_client()
+    file_path = tmp_path / "sample.wav"
+    file_path.write_bytes(b"RIFFfake")
+
+    response = client.post(
+        "/v1/jobs/scan",
+        headers={"X-API-Key": "secret"},
+        json={"directory_path": str(file_path)},
+    )
+
+    assert response.status_code == 400
+    assert "Path is not a directory" in response.get_json()["error"]["message"]
+
+
+def test_api_scan_directory_copies_optional_overrides_to_child_jobs(tmp_path):
+    app, runtime = build_test_app(tmp_path)
+    client = app.test_client()
+    root = tmp_path / "scan-overrides"
+    root.mkdir()
+    audio_path = root / "a.wav"
+    audio_path.write_bytes(b"RIFFfake")
+
+    response = client.post(
+        "/v1/jobs/scan",
+        headers={"X-API-Key": "secret"},
+        json={
+            "directory_path": str(root),
+            "model": "whisper-large-v3",
+            "chunk_duration_sec": 123,
+            "chunk_overlap_sec": 7,
+        },
+    )
+    job_id = response.get_json()["jobs"][0]["id"]
+    stored = runtime["repository"].get(job_id)
+
+    assert response.status_code == 202
+    assert stored.payload.model_override == "whisper-large-v3"
+    assert stored.payload.chunk_duration_sec == 123
+    assert stored.payload.chunk_overlap_sec == 7
+
+
+def test_api_scan_directory_skips_only_previously_succeeded_files(tmp_path):
+    app, runtime = build_test_app(tmp_path)
+    client = app.test_client()
+    root = tmp_path / "scan-duplicates"
+    root.mkdir()
+    audio_path = root / "done.wav"
+    audio_path.write_bytes(b"RIFFfake")
+    normalized_path = str(audio_path.resolve())
+    runtime["repository"].create(
+        TranscriptionJob(
+            job_id="existing-success",
+            status=JobStatus.SUCCEEDED,
+            payload=JobPayload(filename="done.wav", content_type="audio/wav", source_path=normalized_path),
+        )
+    )
+
+    response = client.post(
+        "/v1/jobs/scan",
+        headers={"X-API-Key": "secret"},
+        json={"directory_path": str(root)},
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 202
+    assert payload["scan"]["queued"] == 0
+    assert payload["scan"]["skipped_succeeded"] == 1
+    assert payload["skipped"] == [
+        {
+            "filename": "done.wav",
+            "source_path": normalized_path,
+            "existing_job_id": "existing-success",
+            "reason": "already_succeeded",
+        }
+    ]
+
+
+def test_api_scan_directory_does_not_skip_failed_jobs(tmp_path):
+    app, runtime = build_test_app(tmp_path)
+    client = app.test_client()
+    root = tmp_path / "scan-failed"
+    root.mkdir()
+    audio_path = root / "retry.wav"
+    audio_path.write_bytes(b"RIFFfake")
+    normalized_path = str(audio_path.resolve())
+    runtime["repository"].create(
+        TranscriptionJob(
+            job_id="existing-failed",
+            status=JobStatus.FAILED,
+            payload=JobPayload(filename="retry.wav", content_type="audio/wav", source_path=normalized_path),
+        )
+    )
+
+    response = client.post(
+        "/v1/jobs/scan",
+        headers={"X-API-Key": "secret"},
+        json={"directory_path": str(root)},
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 202
+    assert payload["scan"]["queued"] == 1
+    assert payload["scan"]["skipped_succeeded"] == 0
+
+
+def test_api_scan_created_jobs_can_be_processed_end_to_end(tmp_path):
+    app, runtime = build_test_app(tmp_path)
+    client = app.test_client()
+    root = tmp_path / "scan-process"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    (root / "a.wav").write_bytes(b"RIFFfake")
+    (nested / "b.wav").write_bytes(b"RIFFfake")
+
+    response = client.post(
+        "/v1/jobs/scan",
+        headers={"X-API-Key": "secret"},
+        json={"directory_path": str(root)},
+    )
+    job_ids = [job["id"] for job in response.get_json()["jobs"]]
+
+    while run_single_iteration(runtime):
+        pass
+
+    statuses = [runtime["repository"].get(job_id).status for job_id in job_ids]
+    assert statuses == [JobStatus.SUCCEEDED, JobStatus.SUCCEEDED]
 
 
 def test_worker_retries_retryable_job_until_success(tmp_path):

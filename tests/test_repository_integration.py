@@ -103,3 +103,25 @@ def test_postgres_repository_list_filters_and_healthcheck(repository):
     assert len(repository.list_jobs(provider="groq")) == 1
     assert len(repository.list_jobs(search="transcript")) == 1
     assert repository.healthcheck()["postgres"] == "ok"
+
+
+def test_postgres_repository_finds_latest_by_source_path(repository):
+    older = TranscriptionJob(
+        job_id="repo-5",
+        status=JobStatus.FAILED,
+        payload=JobPayload(filename="same.wav", content_type="audio/wav", source_path="/tmp/same.wav"),
+    )
+    repository.create(older)
+
+    newer = TranscriptionJob(
+        job_id="repo-6",
+        status=JobStatus.SUCCEEDED,
+        payload=JobPayload(filename="same.wav", content_type="audio/wav", source_path="/tmp/same.wav"),
+    )
+    repository.create(newer)
+
+    found = repository.find_latest_by_source_path("/tmp/same.wav")
+
+    assert found is not None
+    assert found.job_id == "repo-6"
+    assert found.status == JobStatus.SUCCEEDED

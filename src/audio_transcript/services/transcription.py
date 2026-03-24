@@ -6,6 +6,7 @@ import logging
 import mimetypes
 import tempfile
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 from ..config import Settings
 from ..domain.errors import NonRetryableProviderError, RetryableProviderError, ValidationError
 from ..domain.models import (
+    JobPayload,
     JobStatus,
     ProviderAttempt,
     TranscriptionJob,
@@ -22,6 +24,7 @@ from ..domain.models import (
     utcnow,
 )
 from ..infra.providers.base import TranscriptionProvider
+from ..infra.queue import QueueBackend
 from ..infra.repository import JobRepository
 from ..infra.runtime_state import RuntimeState
 from ..infra.storage import TranscriptArtifactStore
@@ -43,6 +46,176 @@ class RuntimeDependencies:
     fallback_provider: Optional[TranscriptionProvider]
     inspector: AudioInspector
     chunker: AudioChunker
+
+
+@dataclass
+class DirectoryScanJobEntry:
+    """One job created from a discovered file during a directory scan."""
+
+    id: str
+    status: str
+    filename: str
+    source_path: str
+
+    def to_dict(self) -> Dict[str, str]:
+        """Serialize the queued job summary for the scan response."""
+        return {
+            "id": self.id,
+            "status": self.status,
+            "filename": self.filename,
+            "source_path": self.source_path,
+        }
+
+
+@dataclass
+class DirectoryScanSkipEntry:
+    """One source file skipped during directory scanning."""
+
+    filename: str
+    source_path: str
+    existing_job_id: str
+    reason: str
+
+    def to_dict(self) -> Dict[str, str]:
+        """Serialize the skipped-file summary for the scan response."""
+        return {
+            "filename": self.filename,
+            "source_path": self.source_path,
+            "existing_job_id": self.existing_job_id,
+            "reason": self.reason,
+        }
+
+
+@dataclass
+class DirectoryScanResult:
+    """Aggregate result for a recursive directory scan request."""
+
+    directory_path: str
+    discovered: int
+    queued: int
+    skipped_succeeded: int
+    unsupported: int
+    jobs: List[DirectoryScanJobEntry]
+    skipped: List[DirectoryScanSkipEntry]
+
+    def to_dict(self) -> Dict[str, object]:
+        """Serialize the scan summary returned by the API."""
+        return {
+            "scan": {
+                "directory_path": self.directory_path,
+                "recursive": True,
+                "discovered": self.discovered,
+                "queued": self.queued,
+                "skipped_succeeded": self.skipped_succeeded,
+                "unsupported": self.unsupported,
+            },
+            "jobs": [job.to_dict() for job in self.jobs],
+            "skipped": [item.to_dict() for item in self.skipped],
+        }
+
+
+class DirectoryScanService:
+    """Discover audio files in a directory and enqueue one job per file."""
+
+    def __init__(self, repository: JobRepository, queue: QueueBackend):
+        """Create a scan helper with persistence and queue access."""
+        self.repository = repository
+        self.queue = queue
+        self.logger = logging.getLogger("audio_transcript.directory_scan")
+
+    def scan_directory(
+        self,
+        directory_path: str,
+        *,
+        model_override: Optional[str] = None,
+        chunk_duration_sec: Optional[int] = None,
+        chunk_overlap_sec: Optional[int] = None,
+    ) -> DirectoryScanResult:
+        """Recursively discover supported audio files and queue child jobs."""
+        resolved_dir = Path(directory_path).expanduser().resolve()
+        if not resolved_dir.exists():
+            raise ValidationError(f"Directory does not exist: {resolved_dir}")
+        if not resolved_dir.is_dir():
+            raise ValidationError(f"Path is not a directory: {resolved_dir}")
+
+        jobs: List[DirectoryScanJobEntry] = []
+        skipped: List[DirectoryScanSkipEntry] = []
+        discovered = 0
+        unsupported = 0
+
+        for path in sorted((item for item in resolved_dir.rglob("*") if item.is_file()), key=lambda item: str(item)):
+            discovered += 1
+            normalized_path = str(path.resolve())
+            if not is_supported_audio_file(path):
+                unsupported += 1
+                continue
+
+            existing = self.repository.find_latest_by_source_path(normalized_path)
+            if existing is not None and existing.status == JobStatus.SUCCEEDED:
+                skipped_item = DirectoryScanSkipEntry(
+                    filename=path.name,
+                    source_path=normalized_path,
+                    existing_job_id=existing.job_id,
+                    reason="already_succeeded",
+                )
+                skipped.append(skipped_item)
+                self.logger.info(
+                    "directory scan skipped previously succeeded file",
+                    extra={
+                        "event": "scan_job_skipped",
+                        "source_path": normalized_path,
+                        "existing_job_id": existing.job_id,
+                        "reason": "already_succeeded",
+                    },
+                )
+                continue
+
+            job_id = str(uuid.uuid4())
+            payload = JobPayload(
+                filename=path.name,
+                content_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+                source_path=normalized_path,
+                model_override=model_override,
+                chunk_duration_sec=chunk_duration_sec,
+                chunk_overlap_sec=chunk_overlap_sec,
+            )
+            job = TranscriptionJob(job_id=job_id, status=JobStatus.QUEUED, payload=payload)
+            self.repository.create(job)
+            self.queue.enqueue(job_id)
+            jobs.append(
+                DirectoryScanJobEntry(
+                    id=job_id,
+                    status=job.status.value,
+                    filename=path.name,
+                    source_path=normalized_path,
+                )
+            )
+            self.logger.info(
+                "directory scan queued file",
+                extra={"event": "scan_job_queued", "job_id": job_id, "source_path": normalized_path},
+            )
+
+        result = DirectoryScanResult(
+            directory_path=str(resolved_dir),
+            discovered=discovered,
+            queued=len(jobs),
+            skipped_succeeded=len(skipped),
+            unsupported=unsupported,
+            jobs=jobs,
+            skipped=skipped,
+        )
+        self.logger.info(
+            "directory scan completed",
+            extra={
+                "event": "scan_completed",
+                "directory_path": result.directory_path,
+                "discovered": result.discovered,
+                "queued": result.queued,
+                "skipped_succeeded": result.skipped_succeeded,
+                "unsupported": result.unsupported,
+            },
+        )
+        return result
 
 
 class _TranscriptionExecutionError(Exception):

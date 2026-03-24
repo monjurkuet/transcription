@@ -109,6 +109,30 @@ def create_job():
     )
 
 
+@bp.post("/jobs/scan")
+@require_api_key
+def scan_jobs():
+    payload = request.get_json(silent=True) or {}
+    directory_path = (payload.get("directory_path") or "").strip()
+    if not directory_path:
+        raise ValidationError("directory_path is required")
+
+    chunk_duration = payload.get("chunk_duration_sec")
+    chunk_overlap = payload.get("chunk_overlap_sec")
+    if chunk_duration is not None and not isinstance(chunk_duration, int):
+        raise ValidationError("chunk_duration_sec must be an integer")
+    if chunk_overlap is not None and not isinstance(chunk_overlap, int):
+        raise ValidationError("chunk_overlap_sec must be an integer")
+
+    result = current_app.config["directory_scan_service"].scan_directory(
+        directory_path,
+        model_override=payload.get("model") or None,
+        chunk_duration_sec=chunk_duration,
+        chunk_overlap_sec=chunk_overlap,
+    )
+    return jsonify(result.to_dict()), 202
+
+
 @bp.get("/jobs/<job_id>")
 @require_api_key
 def get_job(job_id: str):

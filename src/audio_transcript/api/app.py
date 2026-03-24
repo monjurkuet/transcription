@@ -13,7 +13,7 @@ from ..logging_utils import clear_request_context, configure_logging, set_reques
 from ..infra.runtime_state import RedisRuntimeState
 from ..services.audio import AudioChunker, AudioInspector
 from ..services.router import ProviderKeyPool, ProviderRouter
-from ..services.transcription import RuntimeDependencies, TranscriptionService
+from ..services.transcription import DirectoryScanService, RuntimeDependencies, TranscriptionService
 from ..infra.providers.groq import GroqProvider
 from ..infra.providers.mistral import MistralProvider
 from ..infra.providers.whisper_cpp import WhisperCppProvider
@@ -81,6 +81,7 @@ def build_runtime(settings: Settings):
             chunker=chunker,
         )
     )
+    directory_scan_service = DirectoryScanService(repository, queue)
     return {
         "settings": settings,
         "repository": repository,
@@ -88,6 +89,7 @@ def build_runtime(settings: Settings):
         "artifact_store": artifact_store,
         "runtime_state": runtime_state,
         "service": service,
+        "directory_scan_service": directory_scan_service,
         "providers": providers,
         "fallback_provider": fallback,
     }
@@ -101,6 +103,7 @@ def create_app(
     artifact_store=None,
     runtime_state=None,
     service=None,
+    directory_scan_service=None,
     providers=None,
     fallback_provider=None,
 ) -> Flask:
@@ -109,7 +112,7 @@ def create_app(
     settings = settings or Settings.from_env()
     configure_logging(settings.log_level, settings.log_format)
     runtime = None
-    if all(item is None for item in (repository, queue, artifact_store, runtime_state, service, providers, fallback_provider)):
+    if all(item is None for item in (repository, queue, artifact_store, runtime_state, service, directory_scan_service, providers, fallback_provider)):
         runtime = build_runtime(settings)
     else:
         runtime = {
@@ -119,12 +122,15 @@ def create_app(
             "artifact_store": artifact_store,
             "runtime_state": runtime_state,
             "service": service,
+            "directory_scan_service": directory_scan_service,
             "providers": providers or {},
             "fallback_provider": fallback_provider,
         }
 
     if runtime["repository"] is None or runtime["queue"] is None or runtime["artifact_store"] is None or runtime["runtime_state"] is None or runtime["service"] is None:
         raise ValueError("repository, queue, artifact_store, runtime_state, and service are required when overriding app runtime")
+    if runtime.get("directory_scan_service") is None:
+        runtime["directory_scan_service"] = DirectoryScanService(runtime["repository"], runtime["queue"])
 
     app.config.update(runtime)
 
