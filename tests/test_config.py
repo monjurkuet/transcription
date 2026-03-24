@@ -91,3 +91,26 @@ def test_settings_rejects_non_positive_numeric_values(monkeypatch):
         Settings.from_env()
 
     assert "MAX_FILE_SIZE_MB" in str(exc_info.value)
+
+
+def test_settings_load_log_format(monkeypatch):
+    monkeypatch.setenv("SERVICE_API_KEY", "secret")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://localhost/db")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_1")
+    monkeypatch.setenv("LOG_FORMAT", "json")
+
+    settings = Settings.from_env()
+
+    assert settings.log_format == "json"
+
+
+def test_settings_rejects_invalid_log_format(monkeypatch):
+    monkeypatch.setenv("SERVICE_API_KEY", "secret")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://localhost/db")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_1")
+    monkeypatch.setenv("LOG_FORMAT", "pretty")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        Settings.from_env()
+
+    assert "LOG_FORMAT" in str(exc_info.value)

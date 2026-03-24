@@ -30,7 +30,7 @@ class JobStatus(str, Enum):
 
 @dataclass
 class FileMetadata:
-    """Normalized source file metadata."""
+    """Normalized source file metadata extracted from ffprobe output."""
 
     filename: str
     path: str
@@ -43,6 +43,7 @@ class FileMetadata:
     channels: int
 
     def to_dict(self) -> Dict[str, Any]:
+        """Serialize metadata for API and artifact persistence."""
         return asdict(self)
 
 
@@ -71,7 +72,7 @@ class TranscriptSegment:
 
 @dataclass
 class TranscriptResult:
-    """Normalized transcript output."""
+    """Normalized transcript output returned by a provider adapter."""
 
     text: str
     segments: List[TranscriptSegment]
@@ -80,6 +81,7 @@ class TranscriptResult:
     raw: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
+        """Serialize transcript content for API and artifact payloads."""
         data = {
             "text": self.text,
             "segments": [segment.to_dict() for segment in self.segments],
@@ -92,7 +94,7 @@ class TranscriptResult:
 
 @dataclass
 class ProviderAttempt:
-    """Audit trail for a provider attempt."""
+    """Audit trail for a single provider attempt against one audio input."""
 
     provider: str
     started_at: datetime
@@ -106,6 +108,7 @@ class ProviderAttempt:
     latency_ms: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
+        """Serialize provider attempt metadata for storage and APIs."""
         return {
             "provider": self.provider,
             "key_id": self.key_id,
@@ -122,7 +125,7 @@ class ProviderAttempt:
 
 @dataclass
 class JobPayload:
-    """Job configuration that comes from the API request."""
+    """Job configuration captured from the original API request."""
 
     filename: str
     content_type: str
@@ -132,12 +135,13 @@ class JobPayload:
     chunk_overlap_sec: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
+        """Serialize the original request payload for persistence."""
         return asdict(self)
 
 
 @dataclass
 class TranscriptionJob:
-    """Persisted job representation."""
+    """Persisted job state shared between API, worker, and storage layers."""
 
     job_id: str
     status: JobStatus
@@ -155,6 +159,7 @@ class TranscriptionJob:
     segment_count: Optional[int] = None
 
     def to_record(self) -> Dict[str, Any]:
+        """Serialize the full job record for repository implementations."""
         return {
             "job_id": self.job_id,
             "status": self.status.value,
@@ -174,6 +179,7 @@ class TranscriptionJob:
 
     @classmethod
     def from_record(cls, record: Dict[str, Any]) -> "TranscriptionJob":
+        """Hydrate a persisted record back into a strongly typed job model."""
         payload = JobPayload(**record["payload"])
         attempts = [
             ProviderAttempt(
@@ -209,6 +215,7 @@ class TranscriptionJob:
         )
 
     def public_dict(self) -> Dict[str, Any]:
+        """Build the public API representation returned by job endpoints."""
         return {
             "job": {
                 "id": self.job_id,
@@ -230,7 +237,7 @@ class TranscriptionJob:
 
 @dataclass
 class ProviderQuotaState:
-    """Status exposed by provider status endpoints."""
+    """Provider key availability exposed by the status endpoint."""
 
     provider: str
     key_id: str
@@ -239,6 +246,7 @@ class ProviderQuotaState:
     last_error: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
+        """Serialize provider quota state for the status endpoint."""
         return {
             "provider": self.provider,
             "key_id": self.key_id,
@@ -253,7 +261,7 @@ def build_result_document(
     transcript: TranscriptResult,
     file_metadata: FileMetadata,
 ) -> Dict[str, Any]:
-    """Create the persisted result schema."""
+    """Create the result document shape served by the result endpoint."""
     return {
         "job": {
             "id": job.job_id,

@@ -27,11 +27,13 @@ class TranscriptArtifactStore:
         self.dataset_root.mkdir(parents=True, exist_ok=True)
 
     def job_dir(self, job_id: str) -> Path:
+        """Return the upload directory for a job, creating it if needed."""
         path = self.root / job_id
         path.mkdir(parents=True, exist_ok=True)
         return path
 
     def save_upload(self, job_id: str, file_storage: FileStorage) -> Path:
+        """Persist an uploaded source file under the job artifact directory."""
         filename = secure_filename(file_storage.filename or "")
         if not filename:
             raise ValidationError("A filename is required")
@@ -55,6 +57,7 @@ class TranscriptArtifactStore:
         transcript: TranscriptResult,
         file_metadata: FileMetadata,
     ) -> str:
+        """Persist transcript summary and segment artifacts as Parquet files."""
         if job.completed_at is None:
             raise ValidationError("Job must be completed before writing artifacts")
 
@@ -104,6 +107,7 @@ class TranscriptArtifactStore:
         segment_offset: int = 0,
         segment_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
+        """Load a stored result document with optional segment pagination."""
         artifact_dir = Path(artifact_uri)
         if artifact_dir.is_file() and artifact_dir.suffix.lower() == ".json":
             with open(artifact_dir, "r", encoding="utf-8") as handle:
@@ -163,6 +167,7 @@ class TranscriptArtifactStore:
         offset: int = 0,
         limit: Optional[int] = None,
     ) -> Iterator[Dict[str, Any]]:
+        """Iterate stored segment rows while applying pagination offsets."""
         yielded = 0
         current_index = 0
         max_items = limit if limit is not None else None

@@ -49,7 +49,12 @@ def _validate_url(value: str, name: str, allowed_schemes: List[str]) -> str:
 
 @dataclass
 class Settings:
-    """Runtime settings."""
+    """Runtime settings loaded from environment variables.
+
+    The settings object centralizes API auth, infrastructure endpoints,
+    provider configuration, processing thresholds, and logging behavior so
+    the API and worker share the same runtime contract.
+    """
 
     service_api_key: str
     database_url: str
@@ -70,6 +75,7 @@ class Settings:
     chunk_overlap_sec: int = 5
     max_file_size_mb: int = 25
     log_level: str = "INFO"
+    log_format: str = "text"
     job_retention_days: int = 7
     queue_name: str = "audio-transcript:jobs"
     dynamic_whisper_cpp_load: bool = False
@@ -94,6 +100,8 @@ class Settings:
             raise ConfigurationError("REQUEST_TIMEOUT_SEC must be > 0")
         if self.provider_max_retries <= 0:
             raise ConfigurationError("PROVIDER_MAX_RETRIES must be > 0")
+        if self.log_format not in {"text", "json"}:
+            raise ConfigurationError("LOG_FORMAT must be either 'text' or 'json'")
         if self.db_pool_min_size <= 0:
             raise ConfigurationError("DB_POOL_MIN_SIZE must be > 0")
         if self.db_pool_max_size < self.db_pool_min_size:
@@ -143,6 +151,7 @@ class Settings:
             chunk_overlap_sec=_parse_int("CHUNK_OVERLAP_SEC", 5),
             max_file_size_mb=_parse_int("MAX_FILE_SIZE_MB", 25),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
+            log_format=os.getenv("LOG_FORMAT", "text").strip().lower() or "text",
             job_retention_days=_parse_int("JOB_RETENTION_DAYS", 7),
             queue_name=os.getenv("QUEUE_NAME", "audio-transcript:jobs"),
             dynamic_whisper_cpp_load=os.getenv("DYNAMIC_WHISPER_CPP_LOAD", "false").lower() == "true",

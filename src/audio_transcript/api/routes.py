@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import uuid
 from pathlib import Path
 
@@ -16,8 +18,27 @@ from .auth import require_api_key
 bp = Blueprint("v1", __name__, url_prefix="/v1")
 
 
+def _check_binary(name: str) -> str:
+    """Return a machine-readable health status for a local binary."""
+    if shutil.which(name) is None:
+        return "not_found"
+    try:
+        proc = subprocess.run(
+            [name, "-version"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    except OSError:
+        return "error"
+    return "ok" if proc.returncode == 0 else "error"
+
+
 @bp.get("/health")
 def health():
+    """Return application readiness and optional deep media-tool checks."""
     repo = current_app.config["repository"]
     queue = current_app.config["queue"]
     runtime_state = current_app.config["runtime_state"]
@@ -25,6 +46,11 @@ def health():
     status.update(repo.healthcheck())
     status.update(queue.healthcheck())
     status.update(runtime_state.healthcheck())
+    if request.args.get("deep", "").lower() == "true":
+        status["ffmpeg"] = _check_binary("ffmpeg")
+        status["ffprobe"] = _check_binary("ffprobe")
+    if any(value != "ok" for key, value in status.items() if key != "status"):
+        status["status"] = "degraded"
     return jsonify(status)
 
 

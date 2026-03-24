@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import uuid
+
 import redis
-from flask import Flask
+from flask import Flask, g, request
 
 from ..config import Settings
 from ..domain.errors import ConfigurationError
-from ..logging_utils import configure_logging
+from ..logging_utils import clear_request_context, configure_logging, set_request_context
 from ..infra.runtime_state import RedisRuntimeState
 from ..services.audio import AudioChunker, AudioInspector
 from ..services.router import ProviderKeyPool, ProviderRouter
@@ -24,7 +26,7 @@ from .routes import bp
 
 def build_runtime(settings: Settings):
     """Construct the runtime dependency graph."""
-    configure_logging(settings.log_level)
+    configure_logging(settings.log_level, settings.log_format)
     redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
     if not settings.database_url:
         raise ConfigurationError("DATABASE_URL is required")
@@ -105,6 +107,7 @@ def create_app(
     """Create a Flask app."""
     app = Flask(__name__)
     settings = settings or Settings.from_env()
+    configure_logging(settings.log_level, settings.log_format)
     runtime = None
     if all(item is None for item in (repository, queue, artifact_store, runtime_state, service, providers, fallback_provider)):
         runtime = build_runtime(settings)
@@ -124,6 +127,25 @@ def create_app(
         raise ValueError("repository, queue, artifact_store, runtime_state, and service are required when overriding app runtime")
 
     app.config.update(runtime)
+
+    @app.before_request
+    def bind_request_id() -> None:
+        request_id = request.headers.get("X-Request-ID") or request.headers.get("X-Request-Id")
+        request_id = request_id or str(uuid.uuid4())
+        g.request_id = request_id
+        g.request_id_token = set_request_context(request_id)
+
+    @app.after_request
+    def attach_request_id(response):
+        request_id = getattr(g, "request_id", None)
+        if request_id:
+            response.headers["X-Request-ID"] = request_id
+        return response
+
+    @app.teardown_request
+    def cleanup_request_context(exception=None) -> None:
+        clear_request_context(getattr(g, "request_id_token", None))
+
     app.register_blueprint(bp)
     register_error_handlers(app)
     return app

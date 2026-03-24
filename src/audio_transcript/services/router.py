@@ -20,7 +20,7 @@ def mask_key(key: str) -> str:
 
 @dataclass
 class KeyState:
-    """Runtime state for a provider key."""
+    """Runtime state tracked for one provider API key."""
 
     raw_key: str
     key_id: str
@@ -29,13 +29,14 @@ class KeyState:
 
     @property
     def available(self) -> bool:
+        """Return whether the key can be selected right now."""
         if self.cooldown_until is None:
             return True
         return datetime.now(timezone.utc) >= self.cooldown_until
 
 
 class ProviderKeyPool:
-    """Round-robin keys within a provider."""
+    """Select provider keys in round-robin order while honoring cooldowns."""
 
     def __init__(self, provider_name: str, keys: List[str], runtime_state: Optional[RuntimeState] = None):
         self.provider_name = provider_name
@@ -45,6 +46,7 @@ class ProviderKeyPool:
         self._states = [KeyState(raw_key=key, key_id=mask_key(key)) for key in keys]
 
     def acquire(self) -> Optional[KeyState]:
+        """Return the next available key, or ``None`` if all are cooling down."""
         with self._lock:
             if not self._states:
                 return None
@@ -60,6 +62,7 @@ class ProviderKeyPool:
             return None
 
     def cooldown(self, key_id: str, seconds: int, error: str) -> None:
+        """Mark a key unavailable for a bounded cooldown window."""
         for state in self._states:
             if state.key_id == key_id:
                 state.cooldown_until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
@@ -69,12 +72,14 @@ class ProviderKeyPool:
                 return
 
     def mark_error(self, key_id: str, error: str) -> None:
+        """Record the latest provider error without changing availability."""
         for state in self._states:
             if state.key_id == key_id:
                 state.last_error = error
                 return
 
     def status(self) -> List[ProviderQuotaState]:
+        """Return status payloads for all configured keys."""
         if self.runtime_state:
             for state in self._states:
                 state.cooldown_until = self.runtime_state.get_provider_cooldown(self.provider_name, state.key_id)
@@ -92,7 +97,7 @@ class ProviderKeyPool:
 
 
 class ProviderRouter:
-    """Route across remote providers first and local fallback last."""
+    """Choose remote provider order while rotating the starting provider."""
 
     def __init__(self, remote_provider_names: List[str]):
         self.remote_provider_names = remote_provider_names
@@ -100,6 +105,7 @@ class ProviderRouter:
         self._lock = Lock()
 
     def select_remote_order(self, available: Dict[str, bool]) -> List[str]:
+        """Return the current remote provider order filtered by availability."""
         with self._lock:
             if not self.remote_provider_names:
                 return []

@@ -1,5 +1,6 @@
 import io
 
+import audio_transcript.api.routes as route_module
 from audio_transcript.api.app import create_app
 from audio_transcript.config import Settings
 from audio_transcript.domain.errors import AudioProcessingError, NonRetryableProviderError, RetryableProviderError, StorageError
@@ -169,6 +170,70 @@ def test_api_result_rejects_invalid_pagination(tmp_path):
     assert bad_offset.get_json()["error"]["message"] == "segment_offset must be >= 0"
     assert bad_limit.status_code == 400
     assert bad_limit.get_json()["error"]["message"] == "segment_limit must be > 0"
+
+
+def test_api_health_deep_includes_media_tools(tmp_path, monkeypatch):
+    app, _ = build_test_app(tmp_path)
+    client = app.test_client()
+
+    monkeypatch.setattr(route_module.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    class CompletedProcess:
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+    monkeypatch.setattr(route_module.subprocess, "run", lambda *args, **kwargs: CompletedProcess(0))
+
+    response = client.get("/v1/health?deep=true")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["status"] == "ok"
+    assert payload["runtime_state"] == "ok"
+    assert payload["memory_queue"] == "ok"
+    assert payload["ffmpeg"] == "ok"
+    assert payload["ffprobe"] == "ok"
+
+
+def test_api_health_deep_degrades_when_media_tool_missing(tmp_path, monkeypatch):
+    app, _ = build_test_app(tmp_path)
+    client = app.test_client()
+
+    monkeypatch.setattr(route_module.shutil, "which", lambda name: None if name == "ffprobe" else f"/usr/bin/{name}")
+
+    class CompletedProcess:
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+    monkeypatch.setattr(route_module.subprocess, "run", lambda *args, **kwargs: CompletedProcess(0))
+
+    response = client.get("/v1/health?deep=true")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["status"] == "degraded"
+    assert payload["ffmpeg"] == "ok"
+    assert payload["ffprobe"] == "not_found"
+
+
+def test_api_preserves_request_id_header(tmp_path):
+    app, _ = build_test_app(tmp_path)
+    client = app.test_client()
+
+    response = client.get("/v1/providers/status", headers={"X-API-Key": "secret", "X-Request-ID": "req-123"})
+
+    assert response.status_code == 200
+    assert response.headers["X-Request-ID"] == "req-123"
+
+
+def test_api_generates_request_id_header(tmp_path):
+    app, _ = build_test_app(tmp_path)
+    client = app.test_client()
+
+    response = client.get("/v1/providers/status", headers={"X-API-Key": "secret"})
+
+    assert response.status_code == 200
+    assert response.headers["X-Request-ID"]
 
 
 def test_worker_retries_retryable_job_until_success(tmp_path):

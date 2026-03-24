@@ -12,13 +12,15 @@ from ..domain.models import FileMetadata, TranscriptResult, TranscriptSegment
 
 
 class AudioInspector:
-    """Audio metadata utilities backed by ffprobe."""
+    """Audio metadata utilities backed by ``ffprobe`` subprocess calls."""
 
     def _subprocess_message(self, exc: subprocess.CalledProcessError) -> str:
+        """Normalize stderr/stdout output for readable processing errors."""
         output = exc.stderr or exc.stdout or "Unknown error"
         return output.strip() or "Unknown error"
 
     def get_duration(self, audio_path: Path) -> float:
+        """Return the duration of an audio file in seconds."""
         cmd = [
             "ffprobe",
             "-v",
@@ -40,6 +42,7 @@ class AudioInspector:
             raise AudioProcessingError(f"Invalid duration value from '{audio_path.name}'") from exc
 
     def get_file_metadata(self, file_path: Path) -> FileMetadata:
+        """Return normalized file metadata for artifact and API payloads."""
         cmd = [
             "ffprobe",
             "-v",
@@ -81,7 +84,7 @@ class AudioInspector:
 
 
 class AudioChunker:
-    """Split long audio files into overlapping wav chunks."""
+    """Split long audio files into overlapping WAV chunks for providers."""
 
     def __init__(self, inspector: AudioInspector):
         self.inspector = inspector
@@ -93,6 +96,7 @@ class AudioChunker:
         duration_sec: int,
         overlap_sec: int,
     ) -> List[Path]:
+        """Create sequential chunk files covering the full source audio."""
         if duration_sec <= overlap_sec:
             raise ValidationError("chunk duration must be greater than overlap")
 
@@ -119,6 +123,7 @@ class AudioChunker:
         start_time: float,
         end_time: float,
     ) -> None:
+        """Write one mono 16kHz PCM WAV chunk to disk via ``ffmpeg``."""
         cmd = [
             "ffmpeg",
             "-y",
@@ -146,7 +151,7 @@ class AudioChunker:
 
 
 def merge_transcripts(chunk_results: List[TranscriptResult], overlap_sec: int) -> TranscriptResult:
-    """Merge chunk results into one transcript."""
+    """Merge chunk transcripts while trimming duplicated overlap speech."""
     if not chunk_results:
         return TranscriptResult(text="", segments=[], provider="merged")
     if len(chunk_results) == 1:

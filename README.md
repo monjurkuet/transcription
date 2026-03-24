@@ -22,6 +22,14 @@ The codebase is now organized as a package under `src/audio_transcript/`:
 - `infra/` providers, Postgres repository, Redis queue/runtime state, and Parquet artifact storage
 - `worker/` background job runner
 
+## Request Flow
+
+1. `POST /v1/jobs` saves the uploaded source file, creates a queued job record, and enqueues the job id.
+2. The worker dequeues the job id and calls `TranscriptionService.process_job(...)`.
+3. The service validates the source artifact, extracts file metadata, and either transcribes directly or chunks large audio first.
+4. Provider attempts are recorded on the job, and successful transcripts are written to Parquet artifacts under `TRANSCRIPT_DATASET_ROOT`.
+5. The API serves job status from the repository and serves transcript content from the stored artifact.
+
 ## Requirements
 
 - Python 3.10+
@@ -122,6 +130,24 @@ Start the worker in a separate terminal:
 .venv/bin/python worker.py
 ```
 
+## Health Checks
+
+Basic readiness:
+
+```bash
+curl http://127.0.0.1:8000/v1/health
+```
+
+This returns the current repository, queue, and runtime-state health keys from the active backend. In production that will typically include keys such as `postgres`, `queue`, and `runtime_state`; in tests or local in-memory runs you may instead see `memory_queue`.
+
+Deep readiness also verifies local media tooling:
+
+```bash
+curl "http://127.0.0.1:8000/v1/health?deep=true"
+```
+
+Deep responses add `ffmpeg` and `ffprobe` with machine-readable values: `ok`, `error`, `timeout`, or `not_found`. The top-level `status` becomes `degraded` if any component is not `ok`.
+
 ## API
 
 ### Health
@@ -171,6 +197,37 @@ curl "http://127.0.0.1:8000/v1/jobs?status=succeeded&provider=groq&search=tradin
 curl http://127.0.0.1:8000/v1/jobs/<job_id>/result \
   -H "X-API-Key: change-me"
 ```
+
+Paginate transcript segments when a result is large:
+
+```bash
+curl "http://127.0.0.1:8000/v1/jobs/<job_id>/result?segment_offset=0&segment_limit=100" \
+  -H "X-API-Key: change-me"
+```
+
+The response includes a `pagination` object only when pagination parameters are provided.
+
+## Worker Retries And DLQ
+
+- Retryable provider failures are requeued with exponential backoff based on `PROVIDER_MAX_RETRIES`.
+- Non-retryable failures are moved directly to the dead-letter queue.
+- Retry-exhausted jobs are marked failed and moved to the dead-letter queue with the last retry count.
+- Redis-backed retry and dead-letter metadata live under the configured queue namespace.
+
+## Logging And Correlation
+
+Set logging behavior with:
+
+```env
+LOG_LEVEL=INFO
+LOG_FORMAT=text
+```
+
+Use `LOG_FORMAT=json` for structured single-line JSON logs. Both API and worker logs include request/job correlation when available:
+
+- API requests accept `X-Request-ID`; if omitted, the app generates one and returns it in the response header.
+- Worker and service logs include `job_id` while a job is being processed.
+- Structured logs also carry event-specific fields such as `provider`, `duration_ms`, `retry_count`, and `error` when available.
 
 ## whisper.cpp Fallback
 
