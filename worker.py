@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Development server entrypoint."""
+"""Worker process entrypoint."""
 
 import sys
 from pathlib import Path
@@ -9,11 +8,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from audio_transcript.api.app import create_app
-
-
-app = create_app()
+from audio_transcript.worker.runner import run_worker_loop
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    run_worker_loop()
