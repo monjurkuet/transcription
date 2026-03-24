@@ -2,7 +2,7 @@ import io
 
 from audio_transcript.api.app import create_app
 from audio_transcript.config import Settings
-from audio_transcript.domain.errors import NonRetryableProviderError, RetryableProviderError
+from audio_transcript.domain.errors import AudioProcessingError, NonRetryableProviderError, RetryableProviderError, StorageError
 from audio_transcript.domain.models import JobStatus, TranscriptResult, TranscriptSegment
 from audio_transcript.infra.queue import InMemoryQueueBackend
 from audio_transcript.infra.repository import InMemoryJobRepository
@@ -179,6 +179,38 @@ def test_api_internal_errors_do_not_leak_details(tmp_path):
     assert payload["message"] == "An unexpected error occurred"
     assert "/home/test" not in payload["message"]
     assert "Traceback" not in payload["message"]
+
+
+def test_api_audio_processing_error_returns_422(tmp_path):
+    app, _ = build_test_app(tmp_path)
+
+    @app.get("/audio-boom")
+    def audio_boom():
+        raise AudioProcessingError("Failed to read audio metadata from 'bad.wav': invalid data")
+
+    client = app.test_client()
+    response = client.get("/audio-boom")
+
+    assert response.status_code == 422
+    payload = response.get_json()["error"]
+    assert payload["code"] == "audio_processing_error"
+    assert "bad.wav" in payload["message"]
+
+
+def test_api_storage_error_returns_generic_message(tmp_path):
+    app, _ = build_test_app(tmp_path)
+
+    @app.get("/storage-boom")
+    def storage_boom():
+        raise StorageError("disk full at /secret/path")
+
+    client = app.test_client()
+    response = client.get("/storage-boom")
+
+    assert response.status_code == 500
+    payload = response.get_json()["error"]
+    assert payload["code"] == "storage_error"
+    assert payload["message"] == "Failed to persist transcript artifacts"
 
 
 def test_api_result_supports_segment_pagination(tmp_path):

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -11,7 +13,7 @@ import pyarrow.parquet as pq
 from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
 
-from ..domain.errors import ArtifactNotFoundError, ValidationError
+from ..domain.errors import ArtifactNotFoundError, StorageError, ValidationError
 from ..domain.models import FileMetadata, TranscriptResult, TranscriptionJob
 
 
@@ -63,10 +65,38 @@ class TranscriptArtifactStore:
 
         segment_rows = self._segment_rows(job, transcript, file_metadata)
         summary_row = self._summary_row(job, transcript, file_metadata, str(artifact_dir))
-
-        pq.write_table(pa.Table.from_pylist(segment_rows), segments_path)
-        pq.write_table(pa.Table.from_pylist([summary_row]), summary_path)
+        try:
+            self._atomic_write_parquet(segment_rows, segments_path)
+            self._atomic_write_parquet([summary_row], summary_path)
+        except Exception as exc:
+            self._cleanup_partial_write(artifact_dir)
+            raise StorageError("Failed to persist transcript artifacts") from exc
         return str(artifact_dir)
+
+    def _atomic_write_parquet(self, rows: List[Dict[str, Any]], target_path: Path) -> None:
+        fd, temp_path = tempfile.mkstemp(suffix=".parquet.tmp", dir=target_path.parent)
+        os.close(fd)
+        try:
+            pq.write_table(pa.Table.from_pylist(rows), temp_path)
+            os.replace(temp_path, target_path)
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
+
+    def _cleanup_partial_write(self, artifact_dir: Path) -> None:
+        for filename in ("segments.parquet", "summary.parquet"):
+            try:
+                (artifact_dir / filename).unlink(missing_ok=True)
+            except OSError:
+                pass
+        for temp_file in artifact_dir.glob("*.parquet.tmp"):
+            try:
+                temp_file.unlink()
+            except OSError:
+                pass
 
     def load_result(
         self,

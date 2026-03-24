@@ -13,8 +13,16 @@ class ValidationError(AudioTranscriptError):
     """Raised when a request cannot be processed."""
 
 
+class AudioProcessingError(AudioTranscriptError):
+    """Raised when local audio tools fail to inspect or transform audio."""
+
+
 class ArtifactNotFoundError(AudioTranscriptError):
     """Raised when a stored job artifact cannot be located."""
+
+
+class StorageError(AudioTranscriptError):
+    """Raised when transcript artifacts cannot be written safely."""
 
 
 class JobNotFoundError(AudioTranscriptError):

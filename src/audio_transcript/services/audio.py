@@ -7,12 +7,16 @@ import subprocess
 from pathlib import Path
 from typing import List
 
-from ..domain.errors import ValidationError
+from ..domain.errors import AudioProcessingError, ValidationError
 from ..domain.models import FileMetadata, TranscriptResult, TranscriptSegment
 
 
 class AudioInspector:
     """Audio metadata utilities backed by ffprobe."""
+
+    def _subprocess_message(self, exc: subprocess.CalledProcessError) -> str:
+        output = exc.stderr or exc.stdout or "Unknown error"
+        return output.strip() or "Unknown error"
 
     def get_duration(self, audio_path: Path) -> float:
         cmd = [
@@ -25,8 +29,15 @@ class AudioInspector:
             "default=noprint_wrappers=1:nokey=1",
             str(audio_path),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return float(result.stdout.strip())
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return float(result.stdout.strip())
+        except subprocess.CalledProcessError as exc:
+            raise AudioProcessingError(
+                f"Failed to read audio duration from '{audio_path.name}': {self._subprocess_message(exc)}"
+            ) from exc
+        except ValueError as exc:
+            raise AudioProcessingError(f"Invalid duration value from '{audio_path.name}'") from exc
 
     def get_file_metadata(self, file_path: Path) -> FileMetadata:
         cmd = [
@@ -39,22 +50,34 @@ class AudioInspector:
             "-show_streams",
             str(file_path),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        raw_metadata = json.loads(result.stdout)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            raw_metadata = json.loads(result.stdout)
+        except subprocess.CalledProcessError as exc:
+            raise AudioProcessingError(
+                f"Failed to read audio metadata from '{file_path.name}': {self._subprocess_message(exc)}"
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise AudioProcessingError(f"Invalid metadata format from '{file_path.name}'") from exc
         format_info = raw_metadata.get("format", {})
         stream_info = raw_metadata.get("streams", [{}])[0] if raw_metadata.get("streams") else {}
+        if not format_info:
+            raise AudioProcessingError(f"No format information found in '{file_path.name}'")
 
-        return FileMetadata(
-            filename=format_info.get("filename", ""),
-            path=str(file_path),
-            size_bytes=int(format_info.get("size", 0)),
-            duration=float(format_info.get("duration", 0)),
-            format=format_info.get("format_name", ""),
-            bit_rate=int(format_info.get("bit_rate", 0)),
-            codec=stream_info.get("codec_name", ""),
-            sample_rate=int(stream_info.get("sample_rate", 0) or 0),
-            channels=int(stream_info.get("channels", 0) or 0),
-        )
+        try:
+            return FileMetadata(
+                filename=format_info.get("filename", ""),
+                path=str(file_path),
+                size_bytes=int(format_info.get("size", 0)),
+                duration=float(format_info.get("duration", 0)),
+                format=format_info.get("format_name", ""),
+                bit_rate=int(format_info.get("bit_rate", 0)),
+                codec=stream_info.get("codec_name", ""),
+                sample_rate=int(stream_info.get("sample_rate", 0) or 0),
+                channels=int(stream_info.get("channels", 0) or 0),
+            )
+        except (TypeError, ValueError) as exc:
+            raise AudioProcessingError(f"Invalid metadata values from '{file_path.name}'") from exc
 
 
 class AudioChunker:
@@ -85,26 +108,41 @@ class AudioChunker:
         for index, start_time in enumerate(start_times):
             end_time = min(start_time + duration_sec, total_duration)
             chunk_path = chunk_dir / f"chunk_{index:03d}.wav"
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(audio_path),
-                "-ss",
-                str(start_time),
-                "-to",
-                str(end_time),
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                "-acodec",
-                "pcm_s16le",
-                str(chunk_path),
-            ]
-            subprocess.run(cmd, capture_output=True, check=True)
+            self._create_chunk(audio_path, chunk_path, start_time, end_time)
             chunk_paths.append(chunk_path)
         return chunk_paths
+
+    def _create_chunk(
+        self,
+        audio_path: Path,
+        chunk_path: Path,
+        start_time: float,
+        end_time: float,
+    ) -> None:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(audio_path),
+            "-ss",
+            str(start_time),
+            "-to",
+            str(end_time),
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-acodec",
+            "pcm_s16le",
+            str(chunk_path),
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as exc:
+            output = exc.stderr or exc.stdout or "Unknown error"
+            raise AudioProcessingError(
+                f"Failed to create chunk for '{audio_path.name}': {output.strip() or 'Unknown error'}"
+            ) from exc
 
 
 def merge_transcripts(chunk_results: List[TranscriptResult], overlap_sec: int) -> TranscriptResult:

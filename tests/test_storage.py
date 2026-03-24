@@ -1,3 +1,8 @@
+from unittest.mock import patch
+
+import pytest
+
+from audio_transcript.domain.errors import StorageError
 from audio_transcript.domain.models import FileMetadata, JobPayload, JobStatus, TranscriptResult, TranscriptSegment, TranscriptionJob
 from audio_transcript.infra.storage import TranscriptArtifactStore
 
@@ -61,3 +66,38 @@ def test_load_result_skips_placeholder_segment_rows(tmp_path):
     result = store.load_result(artifact_uri)
 
     assert result["transcript"]["segments"] == []
+
+
+def test_atomic_write_cleanup_on_failure(tmp_path):
+    audio_path = tmp_path / "sample.wav"
+    audio_path.write_bytes(b"RIFFfake")
+    store = TranscriptArtifactStore(tmp_path / "artifacts", tmp_path / "dataset")
+    job = TranscriptionJob(
+        job_id="job-fail",
+        status=JobStatus.SUCCEEDED,
+        payload=JobPayload(filename=audio_path.name, content_type="audio/wav", source_path=str(audio_path)),
+    )
+    job.completed_at = job.created_at
+    transcript = TranscriptResult(
+        text="joined",
+        segments=[TranscriptSegment(start=0.0, end=1.0, text="segment-0")],
+        provider="groq",
+    )
+
+    write_count = {"count": 0}
+    real_write = __import__("pyarrow.parquet", fromlist=["write_table"]).write_table
+
+    def failing_write(*args, **kwargs):
+        write_count["count"] += 1
+        if write_count["count"] == 2:
+            raise OSError("disk full")
+        return real_write(*args, **kwargs)
+
+    with patch("audio_transcript.infra.storage.pq.write_table", side_effect=failing_write):
+        with pytest.raises(StorageError):
+            store.save_result(job, transcript, make_file_metadata(audio_path))
+
+    artifact_dir = store._partition_dir("groq", job.completed_at, job.job_id)
+    assert not (artifact_dir / "segments.parquet").exists()
+    assert not (artifact_dir / "summary.parquet").exists()
+    assert not list(artifact_dir.glob("*.parquet.tmp"))

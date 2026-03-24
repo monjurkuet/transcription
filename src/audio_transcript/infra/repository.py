@@ -57,7 +57,7 @@ except ImportError:  # pragma: no cover - exercised only when the pool extra is 
                 self._idle.pop().close()
 
 from ..domain.errors import JobNotFoundError
-from ..domain.models import FileMetadata, JobStatus, ProviderAttempt, TranscriptionJob
+from ..domain.models import FileMetadata, JobPayload, JobStatus, ProviderAttempt, TranscriptionJob
 
 
 class JobRepository(ABC):
@@ -399,19 +399,15 @@ class PostgresJobRepository(JobRepository):
         job = TranscriptionJob(
             job_id=row["job_id"],
             status=JobStatus(row["status"]),
-            payload={
-                "filename": row["source_filename"],
-                "content_type": row["content_type"],
-                "source_path": row["source_path"],
-                "model_override": row["model_override"],
-                "chunk_duration_sec": row["chunk_duration_sec"],
-                "chunk_overlap_sec": row["chunk_overlap_sec"],
-            },
+            payload=JobPayload(
+                filename=row["source_filename"],
+                content_type=row["content_type"],
+                source_path=row["source_path"],
+                model_override=row["model_override"],
+                chunk_duration_sec=row["chunk_duration_sec"],
+                chunk_overlap_sec=row["chunk_overlap_sec"],
+            ),
         )
-        # dataclass payload construction using dict
-        from ..domain.models import JobPayload
-
-        job.payload = JobPayload(**job.payload)
         job.created_at = row["created_at"]
         job.started_at = row["started_at"]
         job.completed_at = row["completed_at"]
