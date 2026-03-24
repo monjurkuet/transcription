@@ -17,6 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0.0",
+  "testcontainers[postgres,redis]>=4.8.0",
 ]
 
 [build-system]
@@ -28,3 +29,9 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+  "integration: tests that require Docker-backed services",
+  "ffmpeg: tests that require ffmpeg/ffprobe binaries",
+]

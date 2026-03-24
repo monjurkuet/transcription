@@ -7,62 +7,10 @@ from audio_transcript.domain.models import JobPayload, JobStatus, TranscriptionJ
 from audio_transcript.infra.repository import InMemoryJobRepository
 from audio_transcript.infra.runtime_state import InMemoryRuntimeState
 from audio_transcript.infra.storage import TranscriptArtifactStore
-from audio_transcript.services.audio import AudioChunker, AudioInspector
+from audio_transcript.services.audio import AudioChunker
 from audio_transcript.services.router import ProviderRouter
 from audio_transcript.services.transcription import RuntimeDependencies, TranscriptionService
-
-
-class StaticInspector(AudioInspector):
-    def get_file_metadata(self, file_path: Path):
-        return super().get_file_metadata(file_path) if False else type(
-            "Meta",
-            (),
-            {
-                "to_dict": lambda self: {
-                    "filename": file_path.name,
-                    "path": str(file_path),
-                    "size_bytes": file_path.stat().st_size,
-                    "duration": 1.0,
-                    "format": file_path.suffix.lstrip("."),
-                    "bit_rate": 0,
-                    "codec": "pcm",
-                    "sample_rate": 16000,
-                    "channels": 1,
-                }
-            },
-        )()
-
-
-class FakeInspector(AudioInspector):
-    def get_file_metadata(self, file_path: Path):
-        from audio_transcript.domain.models import FileMetadata
-
-        return FileMetadata(
-            filename=file_path.name,
-            path=str(file_path),
-            size_bytes=file_path.stat().st_size,
-            duration=1.0,
-            format=file_path.suffix.lstrip("."),
-            bit_rate=0,
-            codec="pcm",
-            sample_rate=16000,
-            channels=1,
-        )
-
-
-class FakeProvider:
-    def __init__(self, name, result=None, error=None):
-        self.provider_name = name
-        self.result = result
-        self.error = error
-
-    def transcribe(self, audio_path, content_type, model_override=None):
-        if self.error:
-            raise self.error
-        return self.result
-
-    def status(self):
-        return {"provider": self.provider_name}
+from conftest import FakeInspector, FakeProvider
 
 
 class StubChunker:
